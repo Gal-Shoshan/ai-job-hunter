@@ -1,0 +1,29 @@
+{
+  "_comment": "Rules are checked against the assessment JSON from gemini_client. A field with no rule is ignored. 'min_by' makes a bound depend on another field: here the salary floor rises with the number of office days. History size is not configured here; it is passed to JobHistory by the caller.",
+
+  "rules": {
+    "compatibility": {
+      "allowed": ["Suitable", "Highly suitable"]
+    },
+    "match_score": {
+      "min": 75
+    },
+    "days_per_week": {
+      "min": 2,
+      "max": 3,
+      "zero_is_unknown": true
+    },
+    "estimated_commute_minutes_by_car": {
+      "max": 45,
+      "zero_is_unknown": true
+    },
+    "salary_min_ils_monthly": {
+      "min_by": {
+        "field": "days_per_week",
+        "map": { "2": 10500, "3": 16000 },
+        "default": 10500
+      },
+      "zero_is_unknown": true
+    }
+  }
+}

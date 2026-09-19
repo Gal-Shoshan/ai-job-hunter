@@ -1,0 +1,17 @@
+{
+  "job_source": "the site the listing came from, copied exactly from the listing data",
+  "company_name": "the hiring company, or \"not specified\" if the listing omits it",
+  "job_title": "the exact job title as written in the listing",
+  "location": "city or area of the workplace, or \"Remote\" for fully remote roles",
+  "compatibility": "Not suitable | Suitable | Highly suitable",
+  "match_score": "<int> 0-100: how well my CV matches this listing's requirements",
+  "work_method": "Online | Hybrid | On-site | Not specified",
+  "days_per_week": "<int> office days expected per week; 0 if the listing does not say",
+  "estimated_commute_minutes_by_car": "<int> rough drive time from my home area to the workplace; 0 if remote or if the location is unknown",
+  "salary_min_ils_monthly": "<int> bottom of the monthly gross range in shekels; 0 if it cannot be judged",
+  "salary_max_ils_monthly": "<int> top of the monthly gross range in shekels; 0 if it cannot be judged",
+  "salary_source": "Stated in listing | Estimated",
+  "matching_skills": ["a skill or experience from my CV that this listing asks for"],
+  "missing_skills": ["a requirement in the listing that my CV does not demonstrate"],
+  "description": "two or three sentences: what the role involves and why it does or does not fit my background"
+}
