@@ -122,7 +122,7 @@ Drop `resume.pdf` beside `agent.py`.
 
 Edit the Parameters block at the top of `agent.py`: `SEARCH_TERMS`,
 `JOB_FIELD`, `HOME_LOCATION` (the origin for commute estimates), and
-`LISTINGS_PER_CYCLE` (a per-site quota — two sites at 70 means up to 140
+`LISTINGS_PER_CYCLE` (a per-site quota — two sites at 100 means up to 200
 assessments per cycle).
 
 **5. Run it**

@@ -97,7 +97,7 @@ JOB_FIELD = "A student or entry-level position in Low-Level Systems or Cloud Inf
 RESUME_PATH = Path("resume.pdf")
 HOME_LOCATION = "Shefayim, Israel"
 
-LISTINGS_PER_CYCLE = 70
+LISTINGS_PER_CYCLE = 100
 HISTORY_SIZE = 700
 INTERVAL_HOURS = 24.0
 ENV_FILE = Path(".env")
