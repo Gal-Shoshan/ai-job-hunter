@@ -113,7 +113,6 @@ TELEGRAM_CHAT_ID=...
 | `GEMINI_API_KEY` | Yes | [Google AI Studio](https://aistudio.google.com/apikey) |
 | `TELEGRAM_BOT_TOKEN` | Unless `DRY_RUN` | Message [@BotFather](https://t.me/BotFather) |
 | `TELEGRAM_CHAT_ID` | Unless `DRY_RUN` | Message your bot, then read `https://api.telegram.org/bot<TOKEN>/getUpdates` |
-| `JOB_TEMPLATE` | No | Path to the answer template. Defaults to `llm_format_answer.json` |
 
 **3. Add your CV**
 
