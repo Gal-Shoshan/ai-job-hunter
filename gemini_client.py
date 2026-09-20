@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import asdict, is_dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -30,14 +31,39 @@ from job_search import JobListing
 
 LOG = logging.getLogger(__name__)
 
-# Model names change often; override without editing code.
 # `genai.Client().models.list()` prints what your key can actually reach.
-MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+#
+# Flash-Lite is the cheaper, higher-throughput half of the family, meant for
+# extract-and-classify work like this one: read a listing, fill in a fixed
+# schema. Its per-minute and per-day allowances are considerably larger than
+# the full Flash models', which is what makes a whole cycle fit in a day.
+#
+# Retired models answer 404 "no longer available to new users" on every
+# call, which shows up here as one failed assessment per listing and an
+# empty result set. If that happens, this line is what to change.
+MODEL = "gemini-3.5-flash-lite"
 
 TEMPLATE_PATH = Path(os.environ.get("JOB_TEMPLATE", "llm_format_answer.json"))
 
 # Inline attachment cap for the Gemini API. Larger files need the Files API.
 MAX_INLINE_BYTES = 20 * 1024 * 1024
+
+# A free-tier key allows only a set number of generate_content calls per
+# minute per model, and answers 429 RESOURCE_EXHAUSTED above that. Calls are
+# spaced to use that allowance fully without crossing it. The real figure
+# for this project is on https://aistudio.google.com/rate-limit; set this to
+# match it, raise it once the key is on a paid tier, or use 0 for no pacing.
+REQUESTS_PER_MINUTE = 10.0
+
+# 429 (over quota) and 5xx (model briefly overloaded) are worth waiting out.
+# They say nothing about the listing, so failing it outright throws away a
+# job for a reason that would have cleared in half a minute.
+TRANSPORT_ATTEMPTS = 4
+MAX_RETRY_WAIT = 90.0
+RETRYABLE_CODES = {429, 500, 502, 503, 504}
+_RETRYABLE_STATUSES = ("RESOURCE_EXHAUSTED", "UNAVAILABLE", "INTERNAL")
+
+_last_call_at = 0.0
 
 SYSTEM_INSTRUCTION = (
     "You assess how well a single job listing matches a candidate's resume. "
@@ -46,6 +72,9 @@ SYSTEM_INSTRUCTION = (
     "Fill in every field of the required schema — no field may be left null, "
     "empty, or set to a placeholder. When the listing genuinely does not state "
     "something, write \"not specified\" rather than leaving the field blank. "
+    "Where a field says an estimate is always required, refusing to answer is "
+    "not an option: give your best figure from the role, the seniority and "
+    "the local market, and mark it as estimated. "
     "Return the JSON object only: no commentary and no markdown fences."
 )
 
@@ -113,11 +142,11 @@ Return a JSON object with exactly these keys, every one filled in:
     last_error: Exception | None = None
     for attempt in range(1, max(1, attempts) + 1):
         try:
-            response = _client().models.generate_content(
-                model=MODEL, contents=[resume_part, prompt], config=config
-            )
+            response = _call_model([resume_part, prompt], config)
             parsed = _parse_json_response(response)
             _validate_against_template(parsed, template)
+            _require_estimates(parsed, template,
+                               last_attempt=attempt >= max(1, attempts))
             return _ordered_like(parsed, template)
         except GeminiConfigError:
             raise                      # retrying will not fix the setup
@@ -126,6 +155,74 @@ Return a JSON object with exactly these keys, every one filled in:
             LOG.warning("Attempt %d/%d rejected: %s", attempt, attempts, exc)
 
     raise GeminiError(f"No valid response after {attempts} attempts: {last_error}")
+
+
+def _call_model(contents: list[Any], config: Any) -> Any:
+    """generate_content, paced for the quota and retried when the API asks.
+
+    Quota and overload errors are not verdicts on the listing, so they are
+    waited out here instead of bubbling up to analyze_jobs, which would drop
+    the job and only look at it again on the next cycle.
+    """
+    last_error: Exception | None = None
+
+    for attempt in range(1, max(1, TRANSPORT_ATTEMPTS) + 1):
+        _throttle()
+        try:
+            return _client().models.generate_content(
+                model=MODEL, contents=contents, config=config
+            )
+        except Exception as exc:
+            if not _is_retryable(exc) or attempt == TRANSPORT_ATTEMPTS:
+                raise
+            last_error = exc
+            wait = _retry_after(exc, attempt)
+            LOG.info("%s; waiting %.0fs then retrying (%d/%d).",
+                     _status_name(exc), wait, attempt, TRANSPORT_ATTEMPTS)
+            time.sleep(wait)
+
+    raise last_error   # unreachable: the final attempt re-raises
+
+
+def _throttle() -> None:
+    """Hold each call at least one quota slot after the previous one."""
+    global _last_call_at
+    if REQUESTS_PER_MINUTE <= 0:
+        return
+    gap = 60.0 / REQUESTS_PER_MINUTE
+    wait = gap - (time.monotonic() - _last_call_at)
+    if wait > 0:
+        LOG.debug("Pacing: waiting %.1fs before the next call.", wait)
+        time.sleep(wait)
+    _last_call_at = time.monotonic()
+
+
+def _is_retryable(exc: Exception) -> bool:
+    if isinstance(exc, (GeminiConfigError, GeminiError)):
+        return False           # our own validation errors, not the transport
+    code = getattr(exc, "code", None)
+    if isinstance(code, int):
+        return code in RETRYABLE_CODES
+    text = str(exc)
+    return any(status in text for status in _RETRYABLE_STATUSES)
+
+
+def _retry_after(exc: Exception, attempt: int) -> float:
+    """How long to wait: the API usually states it, otherwise back off."""
+    text = str(exc)
+    for pattern in (r"'retryDelay':\s*'(\d+(?:\.\d+)?)s'",
+                    r"retry in (\d+(?:\.\d+)?)s"):
+        match = re.search(pattern, text)
+        if match:
+            return min(float(match.group(1)) + 1.0, MAX_RETRY_WAIT)
+    return min(5.0 * 2 ** attempt, MAX_RETRY_WAIT)
+
+
+def _status_name(exc: Exception) -> str:
+    for status in _RETRYABLE_STATUSES:
+        if status in str(exc):
+            return status
+    return f"{getattr(exc, 'code', type(exc).__name__)}"
 
 
 def analyze_jobs(
@@ -308,6 +405,42 @@ def _validate_against_template(parsed: Any, template: Any, path: str = "") -> No
 
     if parsed is None or (isinstance(parsed, str) and not parsed.strip()):
         raise GeminiError(f"{where}: field came back empty.")
+
+
+# A template field whose description says so must come back as a real
+# number. The template stays the single source of truth: mark a field by
+# writing "never 0" in its description rather than naming it here.
+_MUST_ESTIMATE = re.compile(r"never\s*0", re.I)
+
+
+def _require_estimates(parsed: Any, template: Any,
+                       *, last_attempt: bool, path: str = "") -> None:
+    """Reject zeros in fields the template insists on an estimate for.
+
+    Raising sends the listing back for another attempt. On the final try the
+    value is kept and logged instead: a missing salary estimate is a poorer
+    assessment, not a reason to throw the whole listing away.
+    """
+    if isinstance(template, dict) and isinstance(parsed, dict):
+        for key, sub_template in template.items():
+            if key in parsed:
+                _require_estimates(parsed[key], sub_template,
+                                   last_attempt=last_attempt,
+                                   path=f"{path}.{key}" if path else key)
+        return
+
+    if not (isinstance(template, str) and _MUST_ESTIMATE.search(template)):
+        return
+    if isinstance(parsed, bool) or not isinstance(parsed, (int, float)):
+        return
+    if parsed != 0:
+        return
+
+    if last_attempt:
+        LOG.warning("%s came back 0 although the template requires an "
+                    "estimate; keeping it.", path or "field")
+        return
+    raise GeminiError(f"{path or 'field'}: an estimate is required, got 0.")
 
 
 def _ordered_like(parsed: Any, template: Any) -> Any:

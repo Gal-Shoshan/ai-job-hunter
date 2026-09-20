@@ -91,10 +91,20 @@ def search_jobs(
     max_pages: int = 1,
     session: requests.Session | None = None,
 ) -> list[JobListing]:
-    """Search `sites` for `terms` and return up to `limit` job listings.
+    """Search `sites` for `terms`, returning up to `limit` listings per site.
 
-    Results are de-duplicated by URL and collected round-robin across sites so
-    one busy board doesn't consume the whole quota.
+    `limit` is a per-site quota, not a total: with three sites it returns up
+    to 3 x limit listings. Sites sharing a name count as one site, since
+    they share a bucket.
+
+    Each term is a plain, natural-language phrase ("junior embedded
+    developer") and is sent to every site exactly as written. Nothing here
+    rewrites, splits or expands it; boards match the words they are given,
+    so the phrasing of a term is entirely the caller's choice.
+
+    Results are de-duplicated by URL. Every site is searched for every term
+    first, and the results are then taken round-robin across the sites, so a
+    busy board cannot crowd out the others and a quiet one costs nothing.
     """
     if isinstance(terms, str):
         terms = [terms]
@@ -104,15 +114,32 @@ def search_jobs(
     configs = [_coerce_site(s) for s in sites]
     session = session or _build_session()
 
-    results: list[JobListing] = []
+    # One bucket per configured URL, merged by site name afterwards. Collect
+    # first and trim at the end: cutting the run short as soon as `limit`
+    # items exist would let whichever URL answers first spend the whole
+    # quota, and the remaining URLs and terms would never be searched.
+    buckets: dict[tuple[str, str], list[JobListing]] = {
+        (site.name, site.search_url): [] for site in configs
+    }
     seen: set[str] = set()
+    fetched_once: set[tuple[str, int]] = set()   # keyed on URL, not name
 
-    # (site, term, page) work items, ordered so sites alternate.
     for page in range(1, max_pages + 1):
         for term in terms:
             for site in configs:
-                if len(results) >= limit:
-                    return results[:limit]
+                bucket = buckets[(site.name, site.search_url)]
+                if len(bucket) >= limit:
+                    continue        # already more than the whole quota
+
+                # A site whose URL has no {query} ignores the term, so every
+                # term would fetch the identical page. Fetch it once instead.
+                if "{query}" not in site.search_url:
+                    # Keyed on the URL template: several configs may share a
+                    # name so they pool into one bucket, and each still gets
+                    # fetched.
+                    if (site.search_url, page) in fetched_once:
+                        continue
+                    fetched_once.add((site.search_url, page))
                 try:
                     found = _search_one(session, site, term, page)
                 except Exception as exc:  # network, parse, anything
@@ -120,17 +147,63 @@ def search_jobs(
                                 site.name, term, page, exc)
                     continue
 
+                # A site answering 200 with nothing parseable used to be
+                # indistinguishable from a site with no matches. Say so.
+                if not found:
+                    LOG.info("%s returned no listings for %r.",
+                             site.name, term)
+
                 for job in found:
                     key = job.url or f"{job.source}:{job.title}:{job.company}"
                     if key in seen:
                         continue
                     seen.add(key)
                     job.search_term = term
-                    results.append(job)
-                    if len(results) >= limit:
-                        return results[:limit]
+                    bucket.append(job)
+                    if len(bucket) >= limit:
+                        break
 
-    return results[:limit]
+    # Merge each site's URLs into one bucket, taking from them in turn so a
+    # busy URL cannot crowd out its siblings, then do the same across sites.
+    by_site: dict[str, list[list[JobListing]]] = {}
+    for (name, url), bucket in buckets.items():
+        by_site.setdefault(name, []).append(bucket)
+        LOG.debug("%s %s: %d listing(s).", name, url, len(bucket))
+
+    sites: list[list[JobListing]] = []
+    for name, url_buckets in by_site.items():
+        merged = _interleave(url_buckets, limit)
+        LOG.info("%s: %d listing(s) found.", name, len(merged))
+        sites.append(merged)
+
+    # limit is per site, so the ceiling on the whole run is limit x sites.
+    return _interleave(sites, limit * len(sites))
+
+
+def _interleave(buckets: Sequence[list[JobListing]], total: int
+                ) -> list[JobListing]:
+    """Take one listing from each bucket in turn, up to `total` in all.
+
+    Used twice: to merge a site's URLs into one bucket, and to merge the
+    sites into the final result. A bucket holding less than its share does
+    not keep a place open; the others simply carry on, so a quiet URL or a
+    quiet board costs nothing.
+    """
+    results: list[JobListing] = []
+    depth = 0
+    while len(results) < total:
+        added = False
+        for bucket in buckets:
+            if depth >= len(bucket):
+                continue
+            results.append(bucket[depth])
+            added = True
+            if len(results) >= total:
+                return results
+        if not added:
+            break               # every bucket exhausted
+        depth += 1
+    return results
 
 
 def _search_one(
@@ -139,18 +212,117 @@ def _search_one(
     term: str,
     page: int,
 ) -> list[JobListing]:
+    # quote_plus only percent-encodes the term so it survives the URL; the
+    # words themselves reach the site unchanged.
     url = site.search_url.format(query=quote_plus(term), page=page)
 
     if site.respect_robots and not _robots_allows(session, url):
         LOG.info("robots.txt disallows %s", url)
         return []
 
-    html = _fetch(session, url, site.headers)
-    parser = site.parser or extract_listings
-    listings = parser(html, url)
+    body, content_type = _fetch(session, url, site.headers)
+
+    if site.parser is not None:
+        listings = site.parser(body, url)
+    elif _looks_like_json(body, content_type):
+        # Several "sites" are really JSON APIs (Remotive, Arbeitnow,
+        # Greenhouse, Lever). Feeding JSON to an HTML parser finds no
+        # <script type="ld+json"> and no <a href>, so it silently yields
+        # nothing at all.
+        listings = extract_from_json(body, url)
+    else:
+        listings = extract_listings(body, url)
+
     for job in listings:
         job.source = job.source or site.name
     return listings
+
+
+def _looks_like_json(body: str, content_type: str) -> bool:
+    if "json" in content_type.lower():
+        return True
+    head = body.lstrip()[:1]
+    return head in ("{", "[")
+
+
+# --------------------------------------------------------------------------- #
+# JSON APIs
+# --------------------------------------------------------------------------- #
+
+# Field names used for the same thing by different APIs, best first.
+_JSON_TITLE = ("title", "job_title", "position", "name", "text")
+_JSON_URL = ("url", "job_url", "apply_url", "applyUrl", "link", "absolute_url")
+_JSON_COMPANY = ("company_name", "companyName", "company", "employer",
+                 "organization", "company_title")
+_JSON_LOCATION = ("candidate_required_location", "location", "job_location",
+                  "city", "region", "locations")
+_JSON_POSTED = ("publication_date", "publishedAt", "created_at", "date",
+                "posted_at", "updated_at", "datePosted")
+_JSON_SALARY = ("salary", "salary_range", "compensation", "pay")
+_JSON_DESC = ("description", "job_description", "content", "excerpt",
+              "descriptionSnippet")
+
+
+def extract_from_json(body: str, page_url: str) -> list[JobListing]:
+    """Pull listings out of a JSON API response.
+
+    Handles schema.org JobPosting objects and the flat shapes used by boards
+    such as Remotive ({"jobs": [{"title": ..., "company_name": ...}]}).
+    """
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError:
+        return []
+
+    listings: list[JobListing] = []
+    seen: set[str] = set()
+
+    for node in _walk(data):
+        if not isinstance(node, dict):
+            continue
+
+        node_type = node.get("@type")
+        types = node_type if isinstance(node_type, list) else [node_type]
+        if "JobPosting" in types:
+            job = _job_from_node(node, page_url)
+        else:
+            title = _text(_first(node, _JSON_TITLE))
+            url = _text(_first(node, _JSON_URL))
+            # Both are required: it keeps nested company/tag objects out.
+            if not title or not url:
+                continue
+            job = JobListing(
+                title=title,
+                company=_text(_first(node, _JSON_COMPANY)),
+                location=_text(_first(node, _JSON_LOCATION)),
+                url=urljoin(page_url, url),
+                posted=_text(_first(node, _JSON_POSTED)),
+                salary=_text(_first(node, _JSON_SALARY)),
+                description=_strip_html(_first(node, _JSON_DESC)),
+            )
+
+        key = job.url or f"{job.title}:{job.company}"
+        if key in seen:
+            continue
+        seen.add(key)
+        listings.append(job)
+
+    return listings
+
+
+def _first(node: dict[str, Any], keys: Sequence[str]) -> Any:
+    """First present, non-empty value among `keys`, flattening one level."""
+    for key in keys:
+        value = node.get(key)
+        if isinstance(value, list):
+            value = next((v for v in value if isinstance(v, str)), None)
+        if isinstance(value, dict):
+            value = value.get("name") or value.get("title")
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            value = str(value)
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -261,7 +433,7 @@ def _salary(node: Any) -> str | None:
 JOB_SEGMENTS = {
     "job", "jobs", "jobad", "joboffer", "job-details", "jobdetails",
     "position", "positions", "vacancy", "vacancies", "opening", "openings",
-    "career", "careers", "listing", "listings", "remote-jobs",
+    "career", "careers", "listing", "listings", "remote-jobs", "jobslobby",
     "משרה", "משרות", "drushim",
 }
 
@@ -413,10 +585,199 @@ def _is_posting_url(url: str, base_host: str) -> bool:
         if key in ID_QUERY_KEYS and _DIGITS.search(value):
             return True
 
-    # No id: accept only a specific multi-word slug, as used by boards like
-    # We Work Remotely (/remote-jobs/acme-corp-backend-engineer).
+    # No id: accept a hyphenated slug, as used by boards like We Work
+    # Remotely (/remote-jobs/acme-corp-backend-engineer) and GotFriends
+    # (/job/backend-developer). Two hyphens used to be required, which
+    # rejected every two-word role title.
     last = tail[-1]
-    return last.count("-") >= 2 and len(last) >= 12
+    return last.count("-") >= 1 and len(last) >= 8
+
+
+# --------------------------------------------------------------------------- #
+# AllJobs
+# --------------------------------------------------------------------------- #
+#
+# AllJobs' public board is SearchResultsGuest.aspx. It takes no free-text
+# parameter: the box on the site is an autocomplete that resolves what you
+# type to a numeric position id and then navigates to
+# SearchResultsGuest.aspx?position=<id>. So a site is configured with the
+# ids for the roles wanted, and its URL carries no {query} at all.
+#
+# The cards are keyed on their apply link rather than on CSS classes, which
+# AllJobs changes far more often than it changes its URL scheme.
+
+_ALLJOBS_JOB_HREF = re.compile(r"UploadSingle\.aspx\?.*JobID=(\d+)", re.I)
+_ALLJOBS_EMPLOYER_HREF = re.compile(r"Employer/HP/Default\.aspx\?.*cid=", re.I)
+_ALLJOBS_CITY_HREF = re.compile(r"SearchResultsGuest\.aspx\?.*[?&]city=\d", re.I)
+
+# Text that belongs to the card's own furniture rather than to the posting.
+_ALLJOBS_NOISE = re.compile(
+    r"הגשת מועמדות|עדכון קורות החיים|מחיקת משרה|שמירת משרה|ביטול שמירה|"
+    r"דיווח על תוכן|שלח משרה למייל|שתף משרה|ללקוח VIP|רכוש חבילת|"
+    r"לעוד משרות ומידע|משרות חברה|עוד\.\.\.|Show more|תודה על שיתוף|"
+    r"^\d+$|^לפני .{1,12}$|^\d+ ימים$|^משרה בלעדית$|^מיקום המשרה:|^סוג משרה:|"
+    r"^Location:|^Job Type:|^מספר מקומות$|^מספר סוגים$"
+)
+
+
+def alljobs_listings(html: str, page_url: str) -> list[JobListing]:
+    """Parse one page of AllJobs search results."""
+    soup = BeautifulSoup(html, "html.parser")
+    listings: list[JobListing] = []
+    seen: set[str] = set()
+
+    for anchor in soup.find_all("a", href=_ALLJOBS_JOB_HREF):
+        match = _ALLJOBS_JOB_HREF.search(anchor["href"])
+        job_number = match.group(1)
+        if job_number in seen:
+            continue        # the title and the logo both link to the job
+
+        title = " ".join(anchor.get_text(" ", strip=True).split())
+        if not title:
+            continue
+        seen.add(job_number)
+
+        card = _alljobs_card(anchor)
+        company = _alljobs_company(card)
+        location = _alljobs_location(card)
+        listings.append(JobListing(
+            title=title,
+            company=company,
+            location=location,
+            url=urljoin(page_url, anchor["href"]),
+            description=_alljobs_description(card, title, company, location),
+        ))
+
+    return listings
+
+
+def _enclosing_card(anchor, href_re, min_text: int = 200):
+    """Walk up from a posting's link to the element holding its whole card.
+
+    Stops at the ancestor that first holds a decent amount of text but not a
+    second posting, so sibling cards never bleed into each other.
+    """
+    card = anchor
+    for parent in anchor.parents:
+        if getattr(parent, "name", None) in (None, "body", "html", "[document]"):
+            break
+        ids = {href_re.search(a["href"]).group(1)
+               for a in parent.find_all("a", href=href_re)}
+        if len(ids) > 1:
+            break               # this ancestor already holds the next card
+        card = parent
+        if len(parent.get_text(" ", strip=True)) > min_text:
+            break
+    return card
+
+
+def _alljobs_card(anchor):
+    return _enclosing_card(anchor, _ALLJOBS_JOB_HREF)
+
+
+def _alljobs_company(card) -> str | None:
+    for link in card.find_all("a", href=_ALLJOBS_EMPLOYER_HREF):
+        name = " ".join(link.get_text(" ", strip=True).split())
+        if name and not name.startswith("לעוד משרות"):
+            return name
+    return None
+
+
+def _alljobs_location(card) -> str | None:
+    cities = []
+    for link in card.find_all("a", href=_ALLJOBS_CITY_HREF):
+        name = " ".join(link.get_text(" ", strip=True).split())
+        if name and name not in cities:
+            cities.append(name)
+    return ", ".join(cities) or None
+
+
+def _alljobs_description(card, title: str, company: str | None,
+                         location: str | None, max_chars: int = 900
+                         ) -> str | None:
+    """The card's text, minus the title, the fields already extracted and
+    the apply/save/report furniture every card repeats."""
+    skip = {title}
+    if company:
+        skip.add(company)
+    if location:
+        skip.update(part.strip() for part in location.split(","))
+
+    lines = []
+    for line in card.get_text("\n", strip=True).split("\n"):
+        line = " ".join(line.split())
+        if not line or line in skip or _ALLJOBS_NOISE.search(line):
+            continue
+        if line not in lines:
+            lines.append(line)
+    text = " ".join(lines)
+    if not text:
+        return None
+    return text[:max_chars].rstrip() + "…" if len(text) > max_chars else text
+
+
+# --------------------------------------------------------------------------- #
+# GotFriends
+# --------------------------------------------------------------------------- #
+#
+# Like AllJobs, GotFriends has no free-text URL parameter: /jobs/ takes only
+# ?page= and ?total=, and narrowing happens by walking into a category under
+# /jobslobby/. So a site is configured with the category pages wanted, and
+# its URL carries no {query}.
+#
+# A posting lives at /jobslobby/<area>/<role>/<number>/ and the agency hides
+# the hiring company by design, so `company` stays empty and Gemini judges
+# the role from the description.
+
+_GOTFRIENDS_JOB_HREF = re.compile(r"/jobslobby/[^?#]*?/(\d{4,})/?$", re.I)
+_GOTFRIENDS_LOCATION = re.compile(r"מיקום:\s*(.+)")
+_GOTFRIENDS_NOISE = re.compile(
+    r"^משרה חמה$|^שלחו|^מס' משרה|^תיאור המשרה:$|^דרישות המשרה:$|"
+    r"^\+ לצפייה|^לצפייה בפרטי"
+)
+
+
+def gotfriends_listings(html: str, page_url: str) -> list[JobListing]:
+    """Parse one page of GotFriends results or one category page."""
+    soup = BeautifulSoup(html, "html.parser")
+    listings: list[JobListing] = []
+    seen: set[str] = set()
+
+    for anchor in soup.find_all("a", href=_GOTFRIENDS_JOB_HREF):
+        number = _GOTFRIENDS_JOB_HREF.search(anchor["href"]).group(1)
+        if number in seen:
+            continue
+        title = " ".join(anchor.get_text(" ", strip=True).split())
+        if not title:
+            continue        # an image or "read more" link to the same job
+        seen.add(number)
+
+        card = _enclosing_card(anchor, _GOTFRIENDS_JOB_HREF)
+        text = card.get_text("\n", strip=True)
+        location = _GOTFRIENDS_LOCATION.search(text)
+
+        listings.append(JobListing(
+            title=title,
+            location=location.group(1).strip() if location else None,
+            url=urljoin(page_url, anchor["href"]),
+            description=_gotfriends_description(card, title),
+        ))
+
+    return listings
+
+
+def _gotfriends_description(card, title: str, max_chars: int = 900) -> str | None:
+    lines = []
+    for line in card.get_text("\n", strip=True).split("\n"):
+        line = " ".join(line.split())
+        if not line or line == title or _GOTFRIENDS_NOISE.search(line):
+            continue
+        if line not in lines:
+            lines.append(line)
+    text = " ".join(lines)
+    if not text:
+        return None
+    return text[:max_chars].rstrip() + "…" if len(text) > max_chars else text
 
 
 # --------------------------------------------------------------------------- #
@@ -437,7 +798,8 @@ def _build_session() -> requests.Session:
 
 
 def _fetch(session: requests.Session, url: str,
-           headers: dict[str, str] | None = None) -> str:
+           headers: dict[str, str] | None = None) -> tuple[str, str]:
+    """GET `url` and return (body, content-type)."""
     host = urlparse(url).netloc
     elapsed = time.monotonic() - _last_request_at.get(host, 0.0)
     if elapsed < CRAWL_DELAY:
@@ -460,9 +822,13 @@ def _fetch(session: requests.Session, url: str,
             f"{url} returned {response.status_code} — listings are not public."
         )
     response.raise_for_status()
-    if _is_login_page(response):
+    content_type = response.headers.get("Content-Type", "")
+    if "json" not in content_type.lower() and _is_login_page(response):
         raise LoginWallError(f"{url} redirected to a sign-in page.")
-    return response.text
+    LOG.debug("%s -> %d, %s, %d bytes",
+              url, response.status_code, content_type or "?",
+              len(response.text))
+    return response.text, content_type
 
 
 _LOGIN_PATH = re.compile(

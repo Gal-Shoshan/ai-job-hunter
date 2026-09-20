@@ -69,3 +69,5 @@ Testing/
 .cache/
 .env
 resume.pdf
+job_history.json
+__pycache__

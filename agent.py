@@ -34,8 +34,9 @@ except ImportError:                      # optional; only needed for .env
 
 from gemini_client import TEMPLATE_PATH, analyze_jobs
 from job_filtering import JobFilter, JobHistory, filter_jobs, job_id
-from job_search import SiteConfig, search_jobs
-from telegram_client import send_job_assessment
+from job_search import (SiteConfig, alljobs_listings,
+                        gotfriends_listings, search_jobs)
+from telegram_client import TelegramUncertain, send_job_assessment
 
 LOG = logging.getLogger("agent")
 
@@ -43,25 +44,71 @@ LOG = logging.getLogger("agent")
 # Parameters — edit these
 # --------------------------------------------------------------------------- #
 
+# --------------------------------------------------------------------------- #
+# Sites
+#
+#   AllJobs     the largest Israeli board. SearchResultsGuest.aspx takes a
+#               free-text parameter, freetxt, which is what the site's own
+#               "חיפוש משרות חופשי" box drives, so SEARCH_TERMS reaches it
+#               directly. It matches anywhere in the ad rather than in the
+#               title alone, so it widens the net rather than narrowing it;
+#               the type= filters below do the narrowing. Each term is run
+#               against all listings, against student-suitable ones, and
+#               against no-experience ones.
+#   GotFriends  a hi-tech placement agency: startup roles, many exclusive.
+#               /jobs/ takes only ?page=, so its entries are categories
+#               rather than queries and carry no {query} — job_search
+#               fetches those once per cycle instead of once per term.
+# Entries sharing a name pool into one bucket, and a site's quota is split
+# evenly across its URLs, so no single URL can spend it all.
+#
+# AllJobs type ids and GotFriends category paths come from the sites' own
+# URLs: apply the filter there and copy it out of the address bar.
+# --------------------------------------------------------------------------- #
+
+_ALLJOBS = ("https://www.alljobs.co.il/SearchResultsGuest.aspx"
+            "?freetxt={query}&page={page}&position=&type=%s&city=&region=")
+_GOTFRIENDS = "https://www.gotfriends.co.il/jobslobby/%s/?page={page}"
+
 SITES: list[SiteConfig] = [
-    SiteConfig(name="GotFriends", search_url="https://www.gotfriends.co.il/jobs/?search={query}"),
-    SiteConfig(name="Jobinfo", search_url="https://www.jobinfo.co.il/jobs?q={query}"),
-    SiteConfig(name="Remotive", search_url="https://remotive.com/api/remote-jobs?category=software-dev&search={query}"),
+    SiteConfig(name="AllJobs", search_url=_ALLJOBS % "",
+               parser=alljobs_listings),          # every listing
+    SiteConfig(name="AllJobs", search_url=_ALLJOBS % "14",
+               parser=alljobs_listings),          # מתאים גם לסטודנטים
+    SiteConfig(name="AllJobs", search_url=_ALLJOBS % "33",
+               parser=alljobs_listings),          # ללא ניסיון
+
+    SiteConfig(name="GotFriends", search_url=_GOTFRIENDS % "software/cplusplus-programmer",
+               parser=gotfriends_listings),
+    SiteConfig(name="GotFriends", search_url=_GOTFRIENDS % "software/real-time-engineerembedded-engineer",
+               parser=gotfriends_listings),
+    SiteConfig(name="GotFriends", search_url=_GOTFRIENDS % "system/linux-system",
+               parser=gotfriends_listings),
+    SiteConfig(name="GotFriends", search_url=_GOTFRIENDS % "software/graduate-with-high-honors",
+               parser=gotfriends_listings),
 ]
 
+# Plain, natural-language phrases. Each is sent to every site exactly as
+# written, so keep them short: boards match the words they are given, and a
+# long phrase quietly matches nothing. One idea per term; add more terms
+# rather than more words.
 SEARCH_TERMS = [
-    '("Student" OR "Junior") AND ("C++" OR "C") AND "Linux"',
-    '("Student" OR "Junior") AND ("Low Level" OR "System" OR "Embedded")',
-    '("Student" OR "Entry Level") AND ("Cloud" OR "Backend" OR "Infrastructure")',
-    '("C++" OR "Python") AND ("Backend" OR "Distributed") AND ("Student" OR "Junior")',
-    '("Linux" OR "Docker") AND ("Cloud" OR "System") AND ("Student" OR "Junior")'
+    "student software developer",
+    "junior C++ developer",
+    "junior Linux developer",
+    "junior embedded developer",
+    "entry level systems programmer",
+    "student backend developer",
+    "junior cloud engineer",
+    "junior infrastructure engineer",
 ]
 
 JOB_FIELD = "A student or entry-level position in Low-Level Systems or Cloud Infrastructure"
 RESUME_PATH = Path("resume.pdf")
 HOME_LOCATION = "Shefayim, Israel"
 
-LISTINGS_PER_CYCLE = 200      # how many listings to pull before assessing
+LISTINGS_PER_CYCLE = 70       # listings to pull PER SITE before assessing;
+                              # 2 sites x 70 = up to 140 Gemini assessments
 HISTORY_SIZE = 700            # how many sent jobs to remember
 INTERVAL_HOURS = 24.0         # pause between cycles
 ENV_FILE = Path(".env")       # optional; secrets may also come from the shell
@@ -166,6 +213,15 @@ def run_cycle(job_filter: JobFilter, history: JobHistory) -> int:
 
         try:
             send_job_assessment(telegram_chat_id(), entry)
+        except TelegramUncertain as exc:
+            # Telegram may already have posted it. Record it anyway: one
+            # job quietly missed beats the same job arriving twice.
+            LOG.warning("Unsure whether %s was sent (%s); recording it as "
+                        "sent so it cannot be posted twice.", title, exc)
+            if identifier:
+                history.add(identifier)
+                handled.add(identifier)
+            continue
         except Exception as exc:
             # Not recorded, so it will be retried next cycle.
             LOG.warning("Could not send %s: %s", title, exc)

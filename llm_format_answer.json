@@ -8,9 +8,9 @@
   "work_method": "Online | Hybrid | On-site | Not specified",
   "days_per_week": "<int> office days expected per week; 0 if the listing does not say",
   "estimated_commute_minutes_by_car": "<int> rough drive time from my home area to the workplace; 0 if remote or if the location is unknown",
-  "salary_min_ils_monthly": "<int> bottom of the monthly gross range in shekels; 0 if it cannot be judged",
-  "salary_max_ils_monthly": "<int> top of the monthly gross range in shekels; 0 if it cannot be judged",
-  "salary_source": "Stated in listing | Estimated",
+  "salary_min_ils_monthly": "<int> bottom of the monthly gross range in shekels. If the listing states pay, copy it; otherwise estimate it from the role, seniority, location and the Israeli market. An estimate is always required — never 0",
+  "salary_max_ils_monthly": "<int> top of the monthly gross range in shekels, on the same basis as the minimum. An estimate is always required — never 0",
+  "salary_source": "Stated in listing, when the listing gives a figure | Estimated, when the numbers above are your own estimate",
   "matching_skills": ["a skill or experience from my CV that this listing asks for"],
   "missing_skills": ["a requirement in the listing that my CV does not demonstrate"],
   "description": "two or three sentences: what the role involves and why it does or does not fit my background"

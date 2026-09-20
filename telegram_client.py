@@ -39,6 +39,17 @@ class TelegramError(RuntimeError):
     """Raised when the Telegram API rejects a request."""
 
 
+class TelegramUncertain(TelegramError):
+    """Raised when a send reached Telegram but the outcome is unknown.
+
+    A read timeout or a 5xx arrives *after* the request was delivered, so
+    Telegram may well have posted the message already. The Bot API has no
+    idempotency key, which means a retry would post it a second time. The
+    send is abandoned instead and the caller decides: treating it as sent
+    risks losing one message, retrying it risks a duplicate.
+    """
+
+
 # --------------------------------------------------------------------------- #
 # Public API
 # --------------------------------------------------------------------------- #
@@ -261,7 +272,14 @@ def _get_session() -> requests.Session:
 
 
 def _call(method: str, payload: dict[str, Any]) -> dict[str, Any]:
-    """POST to the Bot API, honouring rate limits and retrying on 5xx."""
+    """POST to the Bot API, retrying only when nothing can have been sent.
+
+    Retrying a send whose outcome is unknown is what posts a message twice,
+    so only two failures are retried here: one where the connection was
+    never established, and 429, where Telegram states outright that it did
+    not accept the request. A read timeout or a 5xx is reported as
+    TelegramUncertain instead of being repeated.
+    """
     url = f"{API_ROOT}/bot{_token()}/{method}"
 
     for attempt in range(1, MAX_RETRIES + 1):
@@ -269,11 +287,20 @@ def _call(method: str, payload: dict[str, Any]) -> dict[str, Any]:
             response = _get_session().post(
                 url, json=payload, timeout=REQUEST_TIMEOUT
             )
-        except requests.RequestException as exc:
+        except requests.ConnectionError as exc:
+            # No connection, so the request never arrived: safe to repeat.
             if attempt == MAX_RETRIES:
                 raise TelegramError(f"{method} failed: {exc}") from exc
             time.sleep(2 ** attempt)
             continue
+        except requests.Timeout as exc:
+            # Sent, but the reply never came. Telegram may have posted it.
+            raise TelegramUncertain(
+                f"{method} timed out after the request was sent; it may "
+                f"have gone through: {exc}"
+            ) from exc
+        except requests.RequestException as exc:
+            raise TelegramError(f"{method} failed: {exc}") from exc
 
         if response.status_code == 429:
             wait = _retry_after(response)
@@ -281,9 +308,11 @@ def _call(method: str, payload: dict[str, Any]) -> dict[str, Any]:
             time.sleep(wait)
             continue
 
-        if response.status_code >= 500 and attempt < MAX_RETRIES:
-            time.sleep(2 ** attempt)
-            continue
+        if response.status_code >= 500:
+            raise TelegramUncertain(
+                f"{method} returned {response.status_code}; Telegram may "
+                "have posted the message before failing."
+            )
 
         try:
             body = response.json()

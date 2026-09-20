@@ -20,8 +20,8 @@
     "salary_min_ils_monthly": {
       "min_by": {
         "field": "days_per_week",
-        "map": { "2": 10500, "3": 16000 },
-        "default": 10500
+        "map": { "2": 8000 , "3": 12000 },
+        "default": 8000
       },
       "zero_is_unknown": true
     }
