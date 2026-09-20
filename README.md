@@ -100,8 +100,7 @@ pip install requests beautifulsoup4 google-genai python-dotenv
 
 **2. Provide credentials**
 
-Create a `.env` file beside `agent.py`. Write `KEY=value` with no quotes —
-quotes become part of the name.
+Create a `.env` file beside `agent.py`, which contains the following variables:
 
 ```
 GEMINI_API_KEY=...
@@ -127,17 +126,7 @@ Edit the Parameters block at the top of `agent.py`: `SEARCH_TERMS`,
 `LISTINGS_PER_CYCLE` (a per-site quota — two sites at 70 means up to 140
 assessments per cycle).
 
-**5. Try it before trusting it**
-
-```bash
-python tests.py
-```
-
-Every value returned by another module is printed and waits for `True` before
-the run continues. Set `DRY_RUN = True` to exercise everything except the
-Telegram send.
-
-**6. Run it**
+**5. Run it**
 
 ```bash
 python agent.py
