@@ -1,13 +1,23 @@
-"""Send job assessments to Telegram.
+"""Delivery of job assessments to a Telegram chat via the Bot API.
 
-    from telegram_client import send_message, send_job_assessment
+Assessment dictionaries are rendered as readable HTML, split across several
+messages when they exceed Telegram's size cap, and posted to a chat with an
+optional inline button linking back to the original listing.
 
-    send_message(chat_id, assessment_dict)
-    send_job_assessment(chat_id, entry)   # entry from analyze_jobs()
+Example:
+    from telegram_client import send_job_assessment
 
-Requires TELEGRAM_BOT_TOKEN in the environment (create a bot via @BotFather).
-To find your chat_id, message your bot once and read:
-    https://api.telegram.org/bot<TOKEN>/getUpdates
+    send_job_assessment(chat_id, entry)
+
+Environment:
+    TELEGRAM_BOT_TOKEN: bot token issued by @BotFather. Required.
+
+To find a chat id, message the bot once and read the update feed at
+``https://api.telegram.org/bot<TOKEN>/getUpdates``.
+
+Note:
+    The Bot API offers no idempotency key, so a send whose outcome is
+    unknown is never retried here. See ``TelegramUncertain``.
 """
 
 from __future__ import annotations
@@ -26,11 +36,8 @@ LOG = logging.getLogger(__name__)
 API_ROOT = "https://api.telegram.org"
 REQUEST_TIMEOUT = 20
 
-# Telegram caps a text message at 4096 UTF-16 code units; leave room for
-# the header a split adds.
 MAX_MESSAGE_CHARS = 4000
 
-# Telegram tolerates roughly one message per second to a given chat.
 SEND_DELAY = 1.0
 MAX_RETRIES = 3
 
@@ -40,19 +47,15 @@ class TelegramError(RuntimeError):
 
 
 class TelegramUncertain(TelegramError):
-    """Raised when a send reached Telegram but the outcome is unknown.
+    """Raised when a send reached Telegram but its outcome is unknown.
 
-    A read timeout or a 5xx arrives *after* the request was delivered, so
-    Telegram may well have posted the message already. The Bot API has no
-    idempotency key, which means a retry would post it a second time. The
-    send is abandoned instead and the caller decides: treating it as sent
-    risks losing one message, retrying it risks a duplicate.
+    A read timeout or a 5xx arrives after the request was delivered, so
+    Telegram may already have posted the message. Because the Bot API has no
+    idempotency key, a retry would post it a second time. The send is
+    abandoned instead and the caller decides: treating it as sent risks losing
+    one message, retrying it risks a duplicate.
     """
 
-
-# --------------------------------------------------------------------------- #
-# Public API
-# --------------------------------------------------------------------------- #
 
 def send_message(
     chat_id: int | str,
@@ -64,17 +67,26 @@ def send_message(
     as_code: bool = False,
     disable_preview: bool = True,
 ) -> list[dict[str, Any]]:
-    """Send `message` to `chat_id` and return the Telegram result objects.
+    """Post a message to a chat, splitting it if it is too long.
 
-    message     a JSON-shaped dict or list (rendered as readable text), or a
-                plain string (sent as-is).
-    title       optional bold heading placed above the body.
-    labels      override field names, e.g. {"match_score": "Match"}.
-    url_button  (text, url) rendered as a tappable button under the message.
-    as_code     send the raw JSON in a code block instead of formatted text.
+    Args:
+        chat_id: Target chat, as a numeric id or an ``@channelname``.
+        message: A JSON-shaped mapping or sequence, rendered as readable
+            text, or a plain string, sent as-is.
+        title: Bold heading placed above the body. Optional.
+        labels: Field-name overrides, e.g. ``{"match_score": "Match"}``.
+        url_button: A ``(text, url)`` pair rendered as a tappable button
+            beneath the final chunk.
+        as_code: Send the raw JSON in a code block instead of formatted text.
+        disable_preview: Suppress link previews. Defaults to True.
 
-    Long messages are split across several sends; one result dict is
-    returned per send.
+    Returns:
+        One Telegram result object per message sent. A body short enough to
+        fit in a single message yields a one-element list.
+
+    Raises:
+        TelegramError: The API rejected the request or the token is unset.
+        TelegramUncertain: A chunk may or may not have been posted.
     """
     text = _build_text(message, title=title, labels=labels, as_code=as_code)
     chunks = _split_text(text)
@@ -87,7 +99,6 @@ def send_message(
             "parse_mode": "HTML",
             "link_preview_options": {"is_disabled": bool(disable_preview)},
         }
-        # Attach the button only to the final chunk, where it belongs.
         if url_button and index == len(chunks) - 1:
             label, url = url_button
             payload["reply_markup"] = {
@@ -105,7 +116,24 @@ def send_job_assessment(
     *,
     labels: Mapping[str, str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Send one {"job": ..., "assessment": ...} entry from analyze_jobs()."""
+    """Post a single assessed listing.
+
+    The heading combines the job title with the hiring company, and an "Open
+    listing" button is attached when the entry carries a URL.
+
+    Args:
+        chat_id: Target chat, as a numeric id or an ``@channelname``.
+        entry: A ``{"job": ..., "assessment": ...}`` mapping as produced by
+            ``gemini_client.analyze_jobs``. A bare assessment is also accepted.
+        labels: Field-name overrides passed through to ``send_message``.
+
+    Returns:
+        One Telegram result object per message sent.
+
+    Raises:
+        TelegramError: The API rejected the request or the token is unset.
+        TelegramUncertain: The message may or may not have been posted.
+    """
     job = dict(entry.get("job") or {})
     assessment = dict(entry.get("assessment") or entry)
 
@@ -135,7 +163,21 @@ def send_job_assessments(
     labels: Mapping[str, str] | None = None,
     skip_failures: bool = True,
 ) -> int:
-    """Send a batch of assessments. Returns how many went out."""
+    """Post several assessed listings in turn.
+
+    Args:
+        chat_id: Target chat, as a numeric id or an ``@channelname``.
+        entries: Assessed entries from ``gemini_client.analyze_jobs``.
+        labels: Field-name overrides passed through to ``send_message``.
+        skip_failures: Log and continue past a failed send rather than
+            aborting the batch. Defaults to True.
+
+    Returns:
+        How many entries were posted successfully.
+
+    Raises:
+        TelegramError: A send failed and ``skip_failures`` is False.
+    """
     sent = 0
     for entry in entries:
         try:
@@ -149,10 +191,6 @@ def send_job_assessments(
     return sent
 
 
-# --------------------------------------------------------------------------- #
-# Rendering
-# --------------------------------------------------------------------------- #
-
 def _build_text(
     message: Any,
     *,
@@ -160,6 +198,17 @@ def _build_text(
     labels: Mapping[str, str] | None,
     as_code: bool,
 ) -> str:
+    """Render a message body as Telegram-flavoured HTML.
+
+    Args:
+        message: The payload to render.
+        title: Bold heading placed above the body, or None.
+        labels: Field-name overrides, or None.
+        as_code: Render the raw JSON in a ``<pre>`` block instead.
+
+    Returns:
+        The HTML body, ready to be split and sent.
+    """
     if isinstance(message, str):
         body = escape(message)
     elif as_code:
@@ -174,7 +223,16 @@ def _build_text(
 
 
 def _render(data: Any, labels: Mapping[str, str], depth: int = 0) -> list[str]:
-    """Turn JSON data into readable HTML lines."""
+    """Flatten JSON-shaped data into indented HTML lines.
+
+    Args:
+        data: Mapping, sequence or scalar to render.
+        labels: Field-name overrides keyed by the original field name.
+        depth: Current nesting level, used for indentation.
+
+    Returns:
+        One rendered line per field or list item.
+    """
     pad = "  " * depth
     lines: list[str] = []
 
@@ -203,16 +261,40 @@ def _render(data: Any, labels: Mapping[str, str], depth: int = 0) -> list[str]:
 
 
 def _is_seq(value: Any) -> bool:
+    """Report whether a value should be rendered as a list.
+
+    Args:
+        value: The value to test.
+
+    Returns:
+        True for lists and tuples, which render as bullets.
+    """
     return isinstance(value, (list, tuple))
 
 
 def _label(key: str) -> str:
-    """salary_min_ils_monthly -> Salary min ils monthly"""
+    """Turn a field name into a human-readable label.
+
+    Args:
+        key: A snake_case field name, e.g. ``salary_min_ils_monthly``.
+
+    Returns:
+        The label, e.g. ``Salary min ils monthly``.
+    """
     text = str(key).replace("_", " ").strip()
     return text[:1].upper() + text[1:] if text else str(key)
 
 
 def _scalar(value: Any) -> str:
+    """Render a single value for display.
+
+    Args:
+        value: Any scalar drawn from an assessment.
+
+    Returns:
+        Its display form: an em dash for None, yes/no for booleans, and
+        ``str(value)`` otherwise.
+    """
     if value is None:
         return "—"
     if isinstance(value, bool):
@@ -221,7 +303,19 @@ def _scalar(value: Any) -> str:
 
 
 def _split_text(text: str, limit: int = MAX_MESSAGE_CHARS) -> list[str]:
-    """Split on line boundaries, keeping HTML tags intact within a line."""
+    """Split rendered text into sendable chunks.
+
+    Splitting happens on line boundaries so that HTML tags opened and closed
+    within a line are never separated. A single line longer than the limit is
+    cut at the limit.
+
+    Args:
+        text: The rendered HTML body.
+        limit: Maximum characters per chunk. Defaults to MAX_MESSAGE_CHARS.
+
+    Returns:
+        Non-empty chunks in order. Text within the limit yields one chunk.
+    """
     if len(text) <= limit:
         return [text]
 
@@ -230,7 +324,7 @@ def _split_text(text: str, limit: int = MAX_MESSAGE_CHARS) -> list[str]:
     length = 0
 
     for line in text.split("\n"):
-        while len(line) > limit:  # a single oversized line
+        while len(line) > limit:
             if current:
                 chunks.append("\n".join(current))
                 current, length = [], 0
@@ -247,14 +341,18 @@ def _split_text(text: str, limit: int = MAX_MESSAGE_CHARS) -> list[str]:
     return [c for c in chunks if c.strip()]
 
 
-# --------------------------------------------------------------------------- #
-# Transport
-# --------------------------------------------------------------------------- #
-
 _session: requests.Session | None = None
 
 
 def _token() -> str:
+    """Read the bot token from the environment.
+
+    Returns:
+        The token issued by @BotFather.
+
+    Raises:
+        TelegramError: TELEGRAM_BOT_TOKEN is unset or empty.
+    """
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
         raise TelegramError(
@@ -265,6 +363,11 @@ def _token() -> str:
 
 
 def _get_session() -> requests.Session:
+    """Return the shared HTTP session, creating it on first use.
+
+    Returns:
+        A module-level session, so connections are reused across sends.
+    """
     global _session
     if _session is None:
         _session = requests.Session()
@@ -274,11 +377,23 @@ def _get_session() -> requests.Session:
 def _call(method: str, payload: dict[str, Any]) -> dict[str, Any]:
     """POST to the Bot API, retrying only when nothing can have been sent.
 
-    Retrying a send whose outcome is unknown is what posts a message twice,
-    so only two failures are retried here: one where the connection was
-    never established, and 429, where Telegram states outright that it did
-    not accept the request. A read timeout or a 5xx is reported as
-    TelegramUncertain instead of being repeated.
+    Retrying a send whose outcome is unknown is what posts a message twice, so
+    only two failures are repeated here: one where the connection was never
+    established, and 429, where Telegram states outright that it did not
+    accept the request.
+
+    Args:
+        method: Bot API method name, e.g. ``sendMessage``.
+        payload: JSON body for the call.
+
+    Returns:
+        The ``result`` object from the API response.
+
+    Raises:
+        TelegramError: The token is unset, the API rejected the request, or
+            the connection could not be established after MAX_RETRIES tries.
+        TelegramUncertain: The request reached Telegram but no usable reply
+            came back, so the message may or may not have been posted.
     """
     url = f"{API_ROOT}/bot{_token()}/{method}"
 
@@ -288,13 +403,11 @@ def _call(method: str, payload: dict[str, Any]) -> dict[str, Any]:
                 url, json=payload, timeout=REQUEST_TIMEOUT
             )
         except requests.ConnectionError as exc:
-            # No connection, so the request never arrived: safe to repeat.
             if attempt == MAX_RETRIES:
                 raise TelegramError(f"{method} failed: {exc}") from exc
             time.sleep(2 ** attempt)
             continue
         except requests.Timeout as exc:
-            # Sent, but the reply never came. Telegram may have posted it.
             raise TelegramUncertain(
                 f"{method} timed out after the request was sent; it may "
                 f"have gone through: {exc}"
@@ -322,7 +435,6 @@ def _call(method: str, payload: dict[str, Any]) -> dict[str, Any]:
             ) from exc
 
         if not body.get("ok"):
-            # The token never appears here, only in the URL.
             raise TelegramError(
                 f"{method} rejected ({body.get('error_code')}): "
                 f"{body.get('description')}"
@@ -333,6 +445,15 @@ def _call(method: str, payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _retry_after(response: requests.Response) -> float:
+    """Extract how long to wait after a rate-limit response.
+
+    Args:
+        response: A 429 response from the Bot API.
+
+    Returns:
+        Seconds to wait, taken from the API's ``retry_after`` parameter,
+        falling back to the Retry-After header and then to five seconds.
+    """
     try:
         return float(response.json()["parameters"]["retry_after"])
     except (ValueError, KeyError, TypeError):

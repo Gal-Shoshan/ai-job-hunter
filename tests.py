@@ -1,13 +1,24 @@
 #!/usr/bin/env python3
 """Interactive step-through of the agent pipeline.
 
-Same flow as agent.py, but every value returned by a function from another
-project file is printed and must be confirmed before the run continues.
+The same flow as ``agent.py``, except that every value returned by another
+project module is printed and must be confirmed before the run continues.
+Type ``True`` to accept a result and carry on; anything else halts
+immediately. LISTINGS_PER_CYCLE is deliberately small, since each listing
+costs several confirmation prompts.
 
-    export GEMINI_API_KEY=...  TELEGRAM_BOT_TOKEN=...
+Example:
+    export GEMINI_API_KEY=... TELEGRAM_BOT_TOKEN=... TELEGRAM_CHAT_ID=...
     python tests.py
 
-Type True to accept a result and carry on. Anything else halts immediately.
+Environment:
+    GEMINI_API_KEY: Gemini API credentials. Required.
+    TELEGRAM_BOT_TOKEN: bot token from @BotFather. Required unless DRY_RUN.
+    TELEGRAM_CHAT_ID: chat to notify. Required unless DRY_RUN.
+
+Sites:
+    Configured exactly as in ``agent.py``; see that module for what each
+    site contributes and how the per-site quota is shared.
 """
 
 from __future__ import annotations
@@ -26,7 +37,7 @@ from typing import Any
 
 try:
     from dotenv import dotenv_values, load_dotenv
-except ImportError:                      # optional; only needed for .env
+except ImportError:
     dotenv_values = load_dotenv = None
 
 from gemini_client import TEMPLATE_PATH, analyze_jobs
@@ -37,43 +48,17 @@ from telegram_client import TelegramUncertain, send_job_assessment
 
 LOG = logging.getLogger("tests")
 
-# --------------------------------------------------------------------------- #
-# Parameters — edit these
-# --------------------------------------------------------------------------- #
-
-# --------------------------------------------------------------------------- #
-# Sites
-#
-#   AllJobs     the largest Israeli board. SearchResultsGuest.aspx takes a
-#               free-text parameter, freetxt, which is what the site's own
-#               "חיפוש משרות חופשי" box drives, so SEARCH_TERMS reaches it
-#               directly. It matches anywhere in the ad rather than in the
-#               title alone, so it widens the net rather than narrowing it;
-#               the type= filters below do the narrowing. Each term is run
-#               against all listings, against student-suitable ones, and
-#               against no-experience ones.
-#   GotFriends  a hi-tech placement agency: startup roles, many exclusive.
-#               /jobs/ takes only ?page=, so its entries are categories
-#               rather than queries and carry no {query} — job_search
-#               fetches those once per cycle instead of once per term.
-# Entries sharing a name pool into one bucket, and a site's quota is split
-# evenly across its URLs, so no single URL can spend it all.
-#
-# AllJobs type ids and GotFriends category paths come from the sites' own
-# URLs: apply the filter there and copy it out of the address bar.
-# --------------------------------------------------------------------------- #
-
 _ALLJOBS = ("https://www.alljobs.co.il/SearchResultsGuest.aspx"
             "?freetxt={query}&page={page}&position=&type=%s&city=&region=")
 _GOTFRIENDS = "https://www.gotfriends.co.il/jobslobby/%s/?page={page}"
 
 SITES: list[SiteConfig] = [
     SiteConfig(name="AllJobs", search_url=_ALLJOBS % "",
-               parser=alljobs_listings),          # every listing
+               parser=alljobs_listings),
     SiteConfig(name="AllJobs", search_url=_ALLJOBS % "14",
-               parser=alljobs_listings),          # מתאים גם לסטודנטים
+               parser=alljobs_listings),
     SiteConfig(name="AllJobs", search_url=_ALLJOBS % "33",
-               parser=alljobs_listings),          # ללא ניסיון
+               parser=alljobs_listings),
 
     SiteConfig(name="GotFriends", search_url=_GOTFRIENDS % "software/cplusplus-programmer",
                parser=gotfriends_listings),
@@ -85,10 +70,6 @@ SITES: list[SiteConfig] = [
                parser=gotfriends_listings),
 ]
 
-# Plain, natural-language phrases. Each is sent to every site exactly as
-# written, so keep them short: boards match the words they are given, and a
-# long phrase quietly matches nothing. One idea per term; add more terms
-# rather than more words.
 SEARCH_TERMS = [
     "student software developer",
     "junior C++ developer",
@@ -104,43 +85,49 @@ JOB_FIELD = "A student or entry-level position in Low-Level Systems or Cloud Inf
 RESUME_PATH = Path("resume.pdf")
 HOME_LOCATION = "Shefayim, Israel"
 
-# Deliberately small: every listing costs you several confirmation prompts.
-LISTINGS_PER_CYCLE = 5        # listings to pull PER SITE before assessing;
-                              # 2 sites x 5 = up to 10 in one test run
-HISTORY_SIZE = 700            # how many sent jobs to remember
-INTERVAL_HOURS = 24.0         # pause between cycles
-ENV_FILE = Path(".env")       # optional; secrets may also come from the shell
+LISTINGS_PER_CYCLE = 5
+HISTORY_SIZE = 700
+INTERVAL_HOURS = 24.0
+ENV_FILE = Path(".env")
 HISTORY_FILE = Path("job_history.json")
 FILTER_CONFIG = Path("job_filtering.json")
 
-DRY_RUN = False               # True: do everything except send to Telegram
-RUN_ONCE = True               # a test run should not sleep for 24 hours
-LOG_LEVEL = logging.INFO      # logging.DEBUG for per-job detail
+DRY_RUN = False
+RUN_ONCE = True
+LOG_LEVEL = logging.INFO
 
-# Set by SIGINT/SIGTERM so a long sleep can be cut short cleanly.
 _stop = threading.Event()
 
 
 def telegram_chat_id() -> str:
-    """The chat to notify, from .env or the shell.
+    """Return the chat to notify, from .env or the shell.
 
-    Deliberately a function, not a constant: .env is loaded inside main(),
-    which runs long after this module is imported, so a module-level
-    os.environ.get() here would always read an empty value.
+    Deliberately a function rather than a constant: ``.env`` is loaded inside
+    ``main``, long after this module is imported, so a module-level lookup
+    would always read an empty value.
+
+    Returns:
+        The chat id, or an empty string when it is unset.
     """
     return os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
 
-# --------------------------------------------------------------------------- #
-# Confirmation checkpoint
-# --------------------------------------------------------------------------- #
-
 def confirm(label: str, value: Any) -> Any:
-    """Print what another module returned, then wait for True to continue.
+    """Print what another module returned and wait for confirmation.
 
-    Returns the value unchanged, so a call can simply be wrapped:
+    Returns the value unchanged, so a call can simply be wrapped::
 
         listings = confirm("job_search.search_jobs", search_jobs(...))
+
+    Args:
+        label: What produced the value, shown in the banner.
+        value: The value to display.
+
+    Returns:
+        The value, unchanged.
+
+    Raises:
+        SystemExit: The reply was not ``True``, or no input was available.
     """
     print()
     print("=" * 72)
@@ -149,8 +136,6 @@ def confirm(label: str, value: Any) -> Any:
     print(_render(value))
     print("=" * 72, flush=True)
 
-    # When stdout is a pipe it is block-buffered, so the prompt can sit in
-    # the buffer while the program appears to hang. Flush before reading.
     sys.stdout.flush()
 
     try:
@@ -165,12 +150,29 @@ def confirm(label: str, value: Any) -> Any:
 
 
 def _halt(label: str, answer: str) -> None:
+    """Stop the run at a rejected checkpoint.
+
+    Args:
+        label: What produced the value that was rejected.
+        answer: What was typed instead of ``True``.
+
+    Raises:
+        SystemExit: Always, with status 1.
+    """
     print(f"\nHALTED at {label} — got {answer!r} instead of True.")
     sys.exit(1)
 
 
 def _render(value: Any) -> str:
-    """Show the value in the most readable form available."""
+    """Show a value in the most readable form available.
+
+    Args:
+        value: Any value returned by another module.
+
+    Returns:
+        Pretty-printed JSON for dataclasses, mappings and sequences, and a
+        typed repr for everything else.
+    """
     if value is None:
         return "None"
 
@@ -190,12 +192,21 @@ def _render(value: Any) -> str:
     return f"{type(value).__name__}: {value!r}"
 
 
-# --------------------------------------------------------------------------- #
-# One cycle
-# --------------------------------------------------------------------------- #
-
 def run_cycle(job_filter: JobFilter, history: JobHistory) -> int:
-    """Run the pipeline once. Returns how many messages were sent."""
+    """Run the pipeline once.
+
+    Listings already in the history are dropped before any assessment is
+    paid for, and listings reached by more than one term or site are
+    collapsed. Survivors are recorded only once Telegram has accepted them,
+    so a failed send is retried on the next cycle.
+
+    Args:
+        job_filter: The rules deciding which assessments are worth sending.
+        history: Ids already sent, read to skip and written on success.
+
+    Returns:
+        How many messages were sent.
+    """
     LOG.info("Searching %d site(s) for %d term(s)...",
              len(SITES), len(SEARCH_TERMS))
     listings = confirm(
@@ -206,15 +217,12 @@ def run_cycle(job_filter: JobFilter, history: JobHistory) -> int:
     if not listings:
         return 0
 
-    # Skip anything already sent *before* paying for an assessment, and
-    # collapse listings that are the same posting reached by different search
-    # terms or found on more than one site.
     fresh, seen_here = [], set()
     old = duplicates = 0
     for listing in listings:
         identifier = _listing_id(listing)
         if identifier is None:
-            fresh.append(listing)      # no usable ID; judge it later
+            fresh.append(listing)
             continue
         if identifier in history:
             old += 1
@@ -246,7 +254,6 @@ def run_cycle(job_filter: JobFilter, history: JobHistory) -> int:
     if not results:
         return 0
 
-    # remember=False: record only once Telegram has actually accepted it.
     keepers = confirm(
         "job_filtering.filter_jobs",
         filter_jobs(results, job_filter=job_filter, history=history,
@@ -261,8 +268,6 @@ def run_cycle(job_filter: JobFilter, history: JobHistory) -> int:
         score = entry["assessment"].get("match_score", "?")
         identifier = _listing_id(entry)
 
-        # History is only written after a successful send, so a second copy
-        # of the same posting in this batch would otherwise slip through.
         if identifier and (identifier in history or identifier in handled):
             LOG.debug("Skipping duplicate in this batch: %s", title)
             continue
@@ -283,8 +288,6 @@ def run_cycle(job_filter: JobFilter, history: JobHistory) -> int:
         except SystemExit:
             raise
         except TelegramUncertain as exc:
-            # Telegram may already have posted it. Record it anyway: one
-            # job quietly missed beats the same job arriving twice.
             LOG.warning("Unsure whether %s was sent (%s); recording it as "
                         "sent so it cannot be posted twice.", title, exc)
             if identifier:
@@ -292,7 +295,6 @@ def run_cycle(job_filter: JobFilter, history: JobHistory) -> int:
                 handled.add(identifier)
             continue
         except Exception as exc:
-            # Not recorded, so it will be retried next cycle.
             LOG.warning("Could not send %s: %s", title, exc)
             continue
 
@@ -311,11 +313,17 @@ def run_cycle(job_filter: JobFilter, history: JobHistory) -> int:
 
 
 def _listing_id(item) -> str | None:
-    """ID for a raw JobListing or an assessed entry; None if underivable.
+    """Derive an id for a raw listing or an assessed entry.
 
-    Both shapes route through job_filtering.job_id, which hashes the
-    listing's company, content and location — never the assessment — so the
-    pre-Gemini and post-Gemini checks always agree on identity.
+    Both shapes route through ``job_filtering.job_id``, which hashes the
+    listing's company, content and location and never the assessment, so the
+    checks before and after the model runs agree on identity.
+
+    Args:
+        item: A JobListing, an assessed entry, or a listing mapping.
+
+    Returns:
+        The id, or None when the job carries no identifying fields.
     """
     if is_dataclass(item):
         payload = {"job": asdict(item)}
@@ -329,15 +337,13 @@ def _listing_id(item) -> str | None:
         return confirm("job_filtering.job_id (no identifying fields)", None)
 
 
-# --------------------------------------------------------------------------- #
-# Startup
-# --------------------------------------------------------------------------- #
-
 def load_env() -> None:
-    """Copy .env into the environment, if there is one.
+    """Copy ``.env`` into the environment, if there is one.
 
-    Python does not read .env by itself, and the client modules only look at
-    os.environ, so without this step the file is inert.
+    Python does not read ``.env`` by itself and the client modules only look
+    at ``os.environ``, so without this step the file is inert. Variables
+    already exported in the shell win. Missing files are ignored; a missing
+    python-dotenv or a malformed key is reported and the run continues.
     """
     if not ENV_FILE.is_file():
         return
@@ -353,13 +359,21 @@ def load_env() -> None:
                   "quotes part of the name: %s. Write them as KEY=value.",
                   ENV_FILE, ", ".join(quoted))
 
-    # override=False: a variable already exported in the shell wins.
     load_dotenv(ENV_FILE, override=False)
     LOG.info("Loaded %s", ENV_FILE)
 
 
 def check_configuration() -> list[str]:
-    """Catch missing pieces now, not 24 hours from now."""
+    """Check the configuration before the first cycle.
+
+    Catches missing pieces now rather than 24 hours from now: empty site or
+    term lists, absent resume, filter config or answer template, nonsensical
+    numbers, and unset credentials. Telegram credentials are only required
+    when DRY_RUN is off.
+
+    Returns:
+        One message per problem found; empty when the setup is complete.
+    """
     problems: list[str] = []
 
     if not SITES:
@@ -394,11 +408,23 @@ def check_configuration() -> list[str]:
 
 
 def _handle_signal(signum, _frame) -> None:
+    """Ask the run to stop at the end of the current cycle.
+
+    Args:
+        signum: The signal received.
+        _frame: The interrupted stack frame. Unused.
+    """
     LOG.info("Received %s; finishing up.", signal.Signals(signum).name)
     _stop.set()
 
 
 def main() -> int:
+    """Configure logging, validate the setup, and run cycles until stopped.
+
+    Returns:
+        A process exit status: 0 on a clean stop, 1 when the configuration
+        is incomplete.
+    """
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
@@ -437,10 +463,8 @@ def main() -> int:
             LOG.info("Cycle %d done in %.0fs; %d message(s) sent.",
                      cycle, time.monotonic() - started, sent)
         except SystemExit:
-            # A halted checkpoint must stop the run, not be swallowed below.
             raise
         except Exception:
-            # One bad cycle shouldn't end the run; try again next time.
             LOG.exception("Cycle %d failed.", cycle)
 
         if RUN_ONCE or _stop.is_set():
@@ -449,7 +473,7 @@ def main() -> int:
         seconds = INTERVAL_HOURS * 3600
         next_run = datetime.now() + timedelta(seconds=seconds)
         LOG.info("Sleeping until %s.", next_run.strftime("%Y-%m-%d %H:%M"))
-        if _stop.wait(seconds):  # returns early if a signal arrives
+        if _stop.wait(seconds):
             break
 
     LOG.info("Stopped after %d cycle(s).", cycle)

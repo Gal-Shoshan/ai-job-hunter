@@ -1,13 +1,19 @@
-"""Web search functionality for the job bot.
+"""Scraping of public job listings from configured sites.
 
-Public entry point:
+Each site is described by a ``SiteConfig`` whose ``search_url`` is a
+template containing ``{query}`` and optionally ``{page}``. Listings are
+extracted from schema.org JobPosting JSON-LD when a page provides it,
+from a JSON API response when the site is really an API, and otherwise by
+a link heuristic. Sites with unusual markup supply their own parser.
 
-    search_jobs(sites, terms, limit) -> list[JobListing]
+Example:
+    from job_search import SiteConfig, search_jobs
 
-Each site is described by a search-URL template containing ``{query}`` (and
-optionally ``{page}``). Listings are extracted from schema.org JobPosting
-JSON-LD when present, falling back to a link heuristic. Sites with unusual
-markup can supply their own parser.
+    listings = search_jobs(sites, ["backend engineer"], limit=10)
+
+The crawler is anonymous by design: it sends no credentials and no cookies,
+honours ``robots.txt``, and rate-limits itself per host. A site that shows
+listings only to signed-in users is skipped rather than worked around.
 """
 
 from __future__ import annotations
@@ -28,15 +34,24 @@ LOG = logging.getLogger(__name__)
 
 USER_AGENT = "JobSearchBot/0.1 (+you@example.com)"
 REQUEST_TIMEOUT = 15
-CRAWL_DELAY = 1.0  # seconds between requests to the same host
+CRAWL_DELAY = 1.0
 
-
-# --------------------------------------------------------------------------- #
-# Data model
-# --------------------------------------------------------------------------- #
 
 @dataclass
 class JobListing:
+    """One job posting, however it was extracted.
+
+    Attributes:
+        title: The role title as written in the listing.
+        company: The hiring company, when the site names one.
+        location: City or area of the workplace.
+        url: Canonical link to the posting.
+        posted: Publication date, in whatever form the site gives.
+        salary: Pay, as free text, when the listing states it.
+        description: The advert body, trimmed to a readable length.
+        source: Which configured site it came from.
+        search_term: Which search term surfaced it.
+    """
     title: str
     company: str | None = None
     location: str | None = None
@@ -44,22 +59,27 @@ class JobListing:
     posted: str | None = None
     salary: str | None = None
     description: str | None = None
-    source: str | None = None       # which site it came from
-    search_term: str | None = None  # which term surfaced it
+    source: str | None = None
+    search_term: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
+        """Return the listing's fields as a plain dict.
+
+        Returns:
+            Every field, including those that are None.
+        """
         return asdict(self)
 
 
-Parser = Callable[[str, str], list[JobListing]]  # (html, page_url) -> listings
+Parser = Callable[[str, str], list[JobListing]]
 
 
 class LoginWallError(RuntimeError):
     """Raised when a page turns out to require signing in.
 
-    This bot is anonymous by design: it sends no credentials and no cookies
-    you had to log in to obtain. If a site only shows listings to signed-in
-    users, that site is skipped rather than worked around.
+    This crawler is anonymous by design: it sends no credentials and no
+    cookies obtained by logging in. A site that shows listings only to
+    signed-in users is skipped rather than worked around.
     """
 
 
@@ -67,10 +87,18 @@ class LoginWallError(RuntimeError):
 class SiteConfig:
     """How to search one site.
 
-    search_url: template, e.g. "https://example.com/jobs?q={query}&page={page}"
-    parser:     optional site-specific parser; defaults to the generic one.
-    headers:    extra request headers such as Accept-Language. Not a place
-                for cookies, tokens or Authorization — see LoginWallError.
+    Attributes:
+        name: Label for the site. Configs sharing a name pool their results
+            into one bucket, and the site's quota is split evenly across
+            their URLs.
+        search_url: URL template, e.g.
+            ``https://example.com/jobs?q={query}&page={page}``. A template
+            without ``{query}`` ignores the search terms, and is fetched once
+            per cycle rather than once per term.
+        parser: Site-specific parser; the generic extractor is used if None.
+        respect_robots: Consult robots.txt before fetching. Defaults to True.
+        headers: Extra request headers such as Accept-Language. Not a place
+            for cookies, tokens or Authorization; see LoginWallError.
     """
     name: str
     search_url: str
@@ -78,10 +106,6 @@ class SiteConfig:
     respect_robots: bool = True
     headers: dict[str, str] = field(default_factory=dict)
 
-
-# --------------------------------------------------------------------------- #
-# Main entry point
-# --------------------------------------------------------------------------- #
 
 def search_jobs(
     sites: Sequence[SiteConfig | str],
@@ -91,20 +115,25 @@ def search_jobs(
     max_pages: int = 1,
     session: requests.Session | None = None,
 ) -> list[JobListing]:
-    """Search `sites` for `terms`, returning up to `limit` listings per site.
+    """Search sites for terms, returning up to ``limit`` listings per site.
 
-    `limit` is a per-site quota, not a total: with three sites it returns up
-    to 3 x limit listings. Sites sharing a name count as one site, since
-    they share a bucket.
-
-    Each term is a plain, natural-language phrase ("junior embedded
-    developer") and is sent to every site exactly as written. Nothing here
-    rewrites, splits or expands it; boards match the words they are given,
-    so the phrasing of a term is entirely the caller's choice.
+    ``limit`` is a per-site quota rather than a total: with three sites it
+    returns up to three times ``limit``. Configs sharing a name count as one
+    site and share its quota.
 
     Results are de-duplicated by URL. Every site is searched for every term
-    first, and the results are then taken round-robin across the sites, so a
-    busy board cannot crowd out the others and a quiet one costs nothing.
+    first, and the results are then taken round-robin, so a busy board cannot
+    crowd out the others and a quiet one costs nothing.
+
+    Args:
+        sites: SiteConfig objects, or URL templates containing ``{query}``.
+        terms: Search phrases, sent to each site exactly as written.
+        limit: Maximum listings to keep per site. Defaults to 25.
+        max_pages: How many result pages to walk per site and term.
+        session: An HTTP session to reuse. One is created if omitted.
+
+    Returns:
+        Listings interleaved across sites, at most ``limit`` from each.
     """
     if isinstance(terms, str):
         terms = [terms]
@@ -114,41 +143,30 @@ def search_jobs(
     configs = [_coerce_site(s) for s in sites]
     session = session or _build_session()
 
-    # One bucket per configured URL, merged by site name afterwards. Collect
-    # first and trim at the end: cutting the run short as soon as `limit`
-    # items exist would let whichever URL answers first spend the whole
-    # quota, and the remaining URLs and terms would never be searched.
     buckets: dict[tuple[str, str], list[JobListing]] = {
         (site.name, site.search_url): [] for site in configs
     }
     seen: set[str] = set()
-    fetched_once: set[tuple[str, int]] = set()   # keyed on URL, not name
+    fetched_once: set[tuple[str, int]] = set()
 
     for page in range(1, max_pages + 1):
         for term in terms:
             for site in configs:
                 bucket = buckets[(site.name, site.search_url)]
                 if len(bucket) >= limit:
-                    continue        # already more than the whole quota
+                    continue
 
-                # A site whose URL has no {query} ignores the term, so every
-                # term would fetch the identical page. Fetch it once instead.
                 if "{query}" not in site.search_url:
-                    # Keyed on the URL template: several configs may share a
-                    # name so they pool into one bucket, and each still gets
-                    # fetched.
                     if (site.search_url, page) in fetched_once:
                         continue
                     fetched_once.add((site.search_url, page))
                 try:
                     found = _search_one(session, site, term, page)
-                except Exception as exc:  # network, parse, anything
+                except Exception as exc:
                     LOG.warning("%s failed for %r (page %d): %s",
                                 site.name, term, page, exc)
                     continue
 
-                # A site answering 200 with nothing parseable used to be
-                # indistinguishable from a site with no matches. Say so.
                 if not found:
                     LOG.info("%s returned no listings for %r.",
                              site.name, term)
@@ -163,8 +181,6 @@ def search_jobs(
                     if len(bucket) >= limit:
                         break
 
-    # Merge each site's URLs into one bucket, taking from them in turn so a
-    # busy URL cannot crowd out its siblings, then do the same across sites.
     by_site: dict[str, list[list[JobListing]]] = {}
     for (name, url), bucket in buckets.items():
         by_site.setdefault(name, []).append(bucket)
@@ -176,18 +192,24 @@ def search_jobs(
         LOG.info("%s: %d listing(s) found.", name, len(merged))
         sites.append(merged)
 
-    # limit is per site, so the ceiling on the whole run is limit x sites.
     return _interleave(sites, limit * len(sites))
 
 
 def _interleave(buckets: Sequence[list[JobListing]], total: int
                 ) -> list[JobListing]:
-    """Take one listing from each bucket in turn, up to `total` in all.
+    """Take one listing from each bucket in turn, up to ``total`` in all.
 
     Used twice: to merge a site's URLs into one bucket, and to merge the
     sites into the final result. A bucket holding less than its share does
     not keep a place open; the others simply carry on, so a quiet URL or a
     quiet board costs nothing.
+
+    Args:
+        buckets: Listing buckets to draw from, in priority order.
+        total: Maximum listings to return.
+
+    Returns:
+        Listings taken round-robin, at most ``total`` of them.
     """
     results: list[JobListing] = []
     depth = 0
@@ -201,7 +223,7 @@ def _interleave(buckets: Sequence[list[JobListing]], total: int
             if len(results) >= total:
                 return results
         if not added:
-            break               # every bucket exhausted
+            break
         depth += 1
     return results
 
@@ -212,8 +234,21 @@ def _search_one(
     term: str,
     page: int,
 ) -> list[JobListing]:
-    # quote_plus only percent-encodes the term so it survives the URL; the
-    # words themselves reach the site unchanged.
+    """Fetch and parse one site, for one term and one page.
+
+    Args:
+        session: The HTTP session to use.
+        site: The site to search.
+        term: The search phrase, percent-encoded into the URL.
+        page: Which result page to fetch.
+
+    Returns:
+        The listings found, each tagged with the site's name.
+
+    Raises:
+        LoginWallError: The site requires signing in.
+        requests.HTTPError: The site returned an error status.
+    """
     url = site.search_url.format(query=quote_plus(term), page=page)
 
     if site.respect_robots and not _robots_allows(session, url):
@@ -225,10 +260,6 @@ def _search_one(
     if site.parser is not None:
         listings = site.parser(body, url)
     elif _looks_like_json(body, content_type):
-        # Several "sites" are really JSON APIs (Remotive, Arbeitnow,
-        # Greenhouse, Lever). Feeding JSON to an HTML parser finds no
-        # <script type="ld+json"> and no <a href>, so it silently yields
-        # nothing at all.
         listings = extract_from_json(body, url)
     else:
         listings = extract_listings(body, url)
@@ -239,17 +270,21 @@ def _search_one(
 
 
 def _looks_like_json(body: str, content_type: str) -> bool:
+    """Report whether a response body should be parsed as JSON.
+
+    Args:
+        body: The response body.
+        content_type: The response Content-Type header.
+
+    Returns:
+        True when the header says JSON or the body opens like JSON.
+    """
     if "json" in content_type.lower():
         return True
     head = body.lstrip()[:1]
     return head in ("{", "[")
 
 
-# --------------------------------------------------------------------------- #
-# JSON APIs
-# --------------------------------------------------------------------------- #
-
-# Field names used for the same thing by different APIs, best first.
 _JSON_TITLE = ("title", "job_title", "position", "name", "text")
 _JSON_URL = ("url", "job_url", "apply_url", "applyUrl", "link", "absolute_url")
 _JSON_COMPANY = ("company_name", "companyName", "company", "employer",
@@ -267,7 +302,15 @@ def extract_from_json(body: str, page_url: str) -> list[JobListing]:
     """Pull listings out of a JSON API response.
 
     Handles schema.org JobPosting objects and the flat shapes used by boards
-    such as Remotive ({"jobs": [{"title": ..., "company_name": ...}]}).
+    and ATS platforms, e.g. ``{"jobs": [{"title": ..., "company_name": ...}]}``.
+
+    Args:
+        body: The raw JSON response body.
+        page_url: The URL it came from, used to resolve relative links.
+
+    Returns:
+        The listings found, de-duplicated by URL. Unparseable JSON yields an
+        empty list rather than raising.
     """
     try:
         data = json.loads(body)
@@ -288,7 +331,6 @@ def extract_from_json(body: str, page_url: str) -> list[JobListing]:
         else:
             title = _text(_first(node, _JSON_TITLE))
             url = _text(_first(node, _JSON_URL))
-            # Both are required: it keeps nested company/tag objects out.
             if not title or not url:
                 continue
             job = JobListing(
@@ -311,7 +353,16 @@ def extract_from_json(body: str, page_url: str) -> list[JobListing]:
 
 
 def _first(node: dict[str, Any], keys: Sequence[str]) -> Any:
-    """First present, non-empty value among `keys`, flattening one level."""
+    """Return the first present, non-empty value among several keys.
+
+    Args:
+        node: The JSON object to read.
+        keys: Field names to try, in order of preference.
+
+    Returns:
+        The first usable value, flattening one level of list or object, or
+        None when no key holds one.
+    """
     for key in keys:
         value = node.get(key)
         if isinstance(value, list):
@@ -325,12 +376,19 @@ def _first(node: dict[str, Any], keys: Sequence[str]) -> Any:
     return None
 
 
-# --------------------------------------------------------------------------- #
-# Extraction
-# --------------------------------------------------------------------------- #
-
 def extract_listings(html: str, page_url: str) -> list[JobListing]:
-    """Generic extractor: structured data first, link heuristic as fallback."""
+    """Extract listings from an HTML page.
+
+    Structured data is preferred; the link heuristic is a fallback for pages
+    that publish none.
+
+    Args:
+        html: The page source.
+        page_url: The URL it came from, used to resolve relative links.
+
+    Returns:
+        The listings found, possibly empty.
+    """
     soup = BeautifulSoup(html, "html.parser")
     listings = _from_json_ld(soup, page_url)
     if not listings:
@@ -339,6 +397,15 @@ def extract_listings(html: str, page_url: str) -> list[JobListing]:
 
 
 def _from_json_ld(soup: BeautifulSoup, page_url: str) -> list[JobListing]:
+    """Read listings from a page's JSON-LD blocks.
+
+    Args:
+        soup: The parsed page.
+        page_url: The URL it came from, used to resolve relative links.
+
+    Returns:
+        One listing per JobPosting node found, possibly empty.
+    """
     listings: list[JobListing] = []
     for tag in soup.find_all("script", attrs={"type": "application/ld+json"}):
         raw = tag.string or tag.get_text() or ""
@@ -358,7 +425,15 @@ def _from_json_ld(soup: BeautifulSoup, page_url: str) -> list[JobListing]:
 
 
 def _walk(node: Any) -> Iterable[Any]:
-    """Yield every dict/list nested anywhere inside a JSON-LD blob."""
+    """Yield every dict and list nested anywhere inside a JSON-LD blob.
+
+    Args:
+        node: The decoded JSON-LD, at any depth.
+
+    Yields:
+        Each nested container, so JobPosting nodes are found wherever a site
+        chooses to bury them.
+    """
     if isinstance(node, dict):
         yield node
         for value in node.values():
@@ -369,6 +444,15 @@ def _walk(node: Any) -> Iterable[Any]:
 
 
 def _job_from_node(node: dict[str, Any], page_url: str) -> JobListing:
+    """Build a listing from one schema.org JobPosting node.
+
+    Args:
+        node: The JobPosting object.
+        page_url: The URL it came from, used to resolve relative links.
+
+    Returns:
+        The listing, with missing fields left as None.
+    """
     url = node.get("url") or node.get("sameAs") or ""
     return JobListing(
         title=_text(node.get("title")) or "(untitled)",
@@ -382,6 +466,15 @@ def _job_from_node(node: dict[str, Any], page_url: str) -> JobListing:
 
 
 def _location(node: dict[str, Any]) -> str | None:
+    """Read the workplace location from a JobPosting node.
+
+    Args:
+        node: The JobPosting object.
+
+    Returns:
+        "Remote" for telecommute roles, else the locality, region and
+        country joined, or None when the node states no location.
+    """
     if str(node.get("jobLocationType", "")).upper() == "TELECOMMUTE":
         return "Remote"
     loc = node.get("jobLocation")
@@ -404,6 +497,14 @@ def _location(node: dict[str, Any]) -> str | None:
 
 
 def _salary(node: Any) -> str | None:
+    """Read the advertised pay from a JobPosting node.
+
+    Args:
+        node: The value of the node's ``baseSalary`` field.
+
+    Returns:
+        The pay as readable text, or None when the node states none.
+    """
     if isinstance(node, str):
         return node
     if not isinstance(node, dict):
@@ -422,14 +523,6 @@ def _salary(node: Any) -> str | None:
     return None
 
 
-# --- fallback link heuristics ---------------------------------------------- #
-#
-# A job board's search page is mostly navigation. Matching any href containing
-# "/job" pulls in the menu ("דרושים הייטק"), category pages and pagination, so
-# a link is only accepted when its URL is shaped like a single posting AND it
-# sits outside the page's chrome.
-
-# Path segments that introduce one posting.
 JOB_SEGMENTS = {
     "job", "jobs", "jobad", "joboffer", "job-details", "jobdetails",
     "position", "positions", "vacancy", "vacancies", "opening", "openings",
@@ -437,7 +530,6 @@ JOB_SEGMENTS = {
     "משרה", "משרות", "drushim",
 }
 
-# Segments that mean "a page of many jobs", never one posting.
 INDEX_SEGMENTS = {
     "search", "searches", "results", "category", "categories", "cat",
     "browse", "tag", "tags", "topic", "topics", "area", "areas", "city",
@@ -449,26 +541,22 @@ INDEX_SEGMENTS = {
     "קטגוריה", "חיפוש", "רילוקיישן",
 }
 
-# Query keys that carry a posting's id (AllJobs uses ?JobID=123456).
 ID_QUERY_KEYS = {
     "id", "jobid", "job_id", "jid", "jk", "gh_jid", "positionid",
     "position_id", "vacancyid", "vacancy_id", "oid", "pid", "jobcode",
     "jobnumber", "reqid", "requisitionid",
 }
 
-# Query keys that mark a search or category page.
 INDEX_QUERY_KEYS = {
     "q", "query", "search", "keyword", "keywords", "term", "terms", "page",
     "category", "cat", "field", "area", "region", "city", "sort", "filter",
 }
 
-# Containers whose links are site chrome, not results.
 CHROME_TAGS = {"nav", "header", "footer", "aside"}
 CHROME_HINT = re.compile(
     r"nav|menu|header|footer|breadcrumb|sidebar|side-bar|tabs?\b|filter|"
     r"pagination|pager|cookie|banner|social|lang|skip", re.I)
 
-# Link text that names a section rather than a role.
 GENERIC_TEXT = re.compile(
     r"^(all|more|view|see|browse|show|next|prev|previous|back|home|jobs|"
     r"careers|vacancies|positions|login|register|sign in|sign up|apply)\b"
@@ -480,7 +568,18 @@ _DIGITS = re.compile(r"\d{3,}")
 
 
 def _from_links(soup: BeautifulSoup, page_url: str) -> list[JobListing]:
-    """Fallback: anchors whose URL is shaped like a single job posting."""
+    """Find postings by the shape of their links.
+
+    A search page is mostly navigation, so a link is accepted only when its
+    URL looks like a single posting and it sits outside the page's chrome.
+
+    Args:
+        soup: The parsed page.
+        page_url: The URL it came from, used to resolve relative links.
+
+    Returns:
+        One listing per accepted anchor, carrying only a title and a URL.
+    """
     base_host = _host(page_url)
     out: list[JobListing] = []
     seen: set[str] = set()
@@ -506,12 +605,28 @@ def _from_links(soup: BeautifulSoup, page_url: str) -> list[JobListing]:
 
 
 def _host(url: str) -> str:
+    """Return a URL's host, without any ``www.`` prefix.
+
+    Args:
+        url: The URL to read.
+
+    Returns:
+        The bare lowercase host.
+    """
     host = urlparse(url).netloc.lower()
     return host[4:] if host.startswith("www.") else host
 
 
 def _in_chrome(tag) -> bool:
-    """True if the link sits in a nav, header, footer or similar wrapper."""
+    """Report whether a link sits in the page's furniture.
+
+    Args:
+        tag: The anchor to test.
+
+    Returns:
+        True when an ancestor is a nav, header, footer or similar wrapper,
+        which would make the link navigation rather than a result.
+    """
     for parent in tag.parents:
         name = getattr(parent, "name", None)
         if name is None:
@@ -530,15 +645,35 @@ def _in_chrome(tag) -> bool:
 
 
 def _plausible_title(title: str) -> bool:
+    """Report whether link text could be a job title.
+
+    Args:
+        title: The anchor's text.
+
+    Returns:
+        True when it is of a sensible length and does not name a section.
+    """
     if not (5 <= len(title) <= 120):
         return False
     if GENERIC_TEXT.search(title):
         return False
-    return title.count(" ") <= 20      # a paragraph, not a job title
+    return title.count(" ") <= 20
 
 
 def _is_posting_url(url: str, base_host: str) -> bool:
-    """Accept only URLs shaped like one posting, not an index or category."""
+    """Accept only URLs shaped like one posting, not an index.
+
+    An explicit job-id parameter is decisive; otherwise the path must carry a
+    job segment followed by an id or a specific slug.
+
+    Args:
+        url: The absolute URL to test.
+        base_host: The host of the page the link was found on, so off-site
+            adverts are rejected.
+
+    Returns:
+        True when the URL looks like a single posting.
+    """
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
         return False
@@ -548,7 +683,7 @@ def _is_posting_url(url: str, base_host: str) -> bool:
         host = host[4:]
     if base_host and host and host != base_host \
             and not host.endswith("." + base_host):
-        return False               # an advert or an off-site link
+        return False
 
     segments = [unquote(seg).lower() for seg in parsed.path.split("/") if seg]
     if not segments:
@@ -557,7 +692,6 @@ def _is_posting_url(url: str, base_host: str) -> bool:
     query = {k.lower(): v for k, v in parse_qsl(parsed.query)}
     has_index_query = any(k in INDEX_QUERY_KEYS for k in query)
 
-    # An explicit job-id parameter is decisive: /Search/Single.aspx?JobID=12345
     if not has_index_query:
         for key, value in query.items():
             if key in ID_QUERY_KEYS and _DIGITS.search(value) \
@@ -576,41 +710,22 @@ def _is_posting_url(url: str, base_host: str) -> bool:
 
     tail = segments[job_at + 1:]
     if not tail:
-        return False               # "/jobs/" is the index itself
+        return False
 
-    # A numeric id anywhere after the job segment: /jobs/12345, /job/12345-dev
     if any(_DIGITS.search(seg) for seg in tail):
         return True
     for key, value in query.items():
         if key in ID_QUERY_KEYS and _DIGITS.search(value):
             return True
 
-    # No id: accept a hyphenated slug, as used by boards like We Work
-    # Remotely (/remote-jobs/acme-corp-backend-engineer) and GotFriends
-    # (/job/backend-developer). Two hyphens used to be required, which
-    # rejected every two-word role title.
     last = tail[-1]
     return last.count("-") >= 1 and len(last) >= 8
 
-
-# --------------------------------------------------------------------------- #
-# AllJobs
-# --------------------------------------------------------------------------- #
-#
-# AllJobs' public board is SearchResultsGuest.aspx. It takes no free-text
-# parameter: the box on the site is an autocomplete that resolves what you
-# type to a numeric position id and then navigates to
-# SearchResultsGuest.aspx?position=<id>. So a site is configured with the
-# ids for the roles wanted, and its URL carries no {query} at all.
-#
-# The cards are keyed on their apply link rather than on CSS classes, which
-# AllJobs changes far more often than it changes its URL scheme.
 
 _ALLJOBS_JOB_HREF = re.compile(r"UploadSingle\.aspx\?.*JobID=(\d+)", re.I)
 _ALLJOBS_EMPLOYER_HREF = re.compile(r"Employer/HP/Default\.aspx\?.*cid=", re.I)
 _ALLJOBS_CITY_HREF = re.compile(r"SearchResultsGuest\.aspx\?.*[?&]city=\d", re.I)
 
-# Text that belongs to the card's own furniture rather than to the posting.
 _ALLJOBS_NOISE = re.compile(
     r"הגשת מועמדות|עדכון קורות החיים|מחיקת משרה|שמירת משרה|ביטול שמירה|"
     r"דיווח על תוכן|שלח משרה למייל|שתף משרה|ללקוח VIP|רכוש חבילת|"
@@ -621,7 +736,18 @@ _ALLJOBS_NOISE = re.compile(
 
 
 def alljobs_listings(html: str, page_url: str) -> list[JobListing]:
-    """Parse one page of AllJobs search results."""
+    """Parse one page of AllJobs search results.
+
+    Cards are keyed on their apply link rather than on CSS classes, which
+    AllJobs changes far more often than its URL scheme.
+
+    Args:
+        html: The page source.
+        page_url: The URL it came from, used to resolve relative links.
+
+    Returns:
+        One listing per posting, de-duplicated by job id.
+    """
     soup = BeautifulSoup(html, "html.parser")
     listings: list[JobListing] = []
     seen: set[str] = set()
@@ -630,7 +756,7 @@ def alljobs_listings(html: str, page_url: str) -> list[JobListing]:
         match = _ALLJOBS_JOB_HREF.search(anchor["href"])
         job_number = match.group(1)
         if job_number in seen:
-            continue        # the title and the logo both link to the job
+            continue
 
         title = " ".join(anchor.get_text(" ", strip=True).split())
         if not title:
@@ -652,10 +778,19 @@ def alljobs_listings(html: str, page_url: str) -> list[JobListing]:
 
 
 def _enclosing_card(anchor, href_re, min_text: int = 200):
-    """Walk up from a posting's link to the element holding its whole card.
+    """Walk up from a posting's link to the element holding its card.
 
     Stops at the ancestor that first holds a decent amount of text but not a
     second posting, so sibling cards never bleed into each other.
+
+    Args:
+        anchor: The posting's link.
+        href_re: Pattern identifying a posting link, used to detect when an
+            ancestor already spans two cards.
+        min_text: How much text marks an ancestor as the whole card.
+
+    Returns:
+        The element holding the card.
     """
     card = anchor
     for parent in anchor.parents:
@@ -664,7 +799,7 @@ def _enclosing_card(anchor, href_re, min_text: int = 200):
         ids = {href_re.search(a["href"]).group(1)
                for a in parent.find_all("a", href=href_re)}
         if len(ids) > 1:
-            break               # this ancestor already holds the next card
+            break
         card = parent
         if len(parent.get_text(" ", strip=True)) > min_text:
             break
@@ -672,10 +807,26 @@ def _enclosing_card(anchor, href_re, min_text: int = 200):
 
 
 def _alljobs_card(anchor):
+    """Return the element holding one AllJobs card.
+
+    Args:
+        anchor: The posting's apply link.
+
+    Returns:
+        The element holding the card.
+    """
     return _enclosing_card(anchor, _ALLJOBS_JOB_HREF)
 
 
 def _alljobs_company(card) -> str | None:
+    """Read the hiring company from an AllJobs card.
+
+    Args:
+        card: The element holding the card.
+
+    Returns:
+        The employer name, or None when the listing is anonymous.
+    """
     for link in card.find_all("a", href=_ALLJOBS_EMPLOYER_HREF):
         name = " ".join(link.get_text(" ", strip=True).split())
         if name and not name.startswith("לעוד משרות"):
@@ -684,6 +835,14 @@ def _alljobs_company(card) -> str | None:
 
 
 def _alljobs_location(card) -> str | None:
+    """Read the workplace locations from an AllJobs card.
+
+    Args:
+        card: The element holding the card.
+
+    Returns:
+        The cities joined by commas, or None when none are linked.
+    """
     cities = []
     for link in card.find_all("a", href=_ALLJOBS_CITY_HREF):
         name = " ".join(link.get_text(" ", strip=True).split())
@@ -695,8 +854,19 @@ def _alljobs_location(card) -> str | None:
 def _alljobs_description(card, title: str, company: str | None,
                          location: str | None, max_chars: int = 900
                          ) -> str | None:
-    """The card's text, minus the title, the fields already extracted and
-    the apply/save/report furniture every card repeats."""
+    """Extract the advert body from an AllJobs card.
+
+    Args:
+        card: The element holding the card.
+        title: The job title, removed from the body.
+        company: The employer name, removed from the body.
+        location: The locations, removed from the body.
+        max_chars: Where to trim the result.
+
+    Returns:
+        The body without the title, the extracted fields or the apply, save
+        and report furniture every card repeats. None when nothing is left.
+    """
     skip = {title}
     if company:
         skip.add(company)
@@ -716,19 +886,6 @@ def _alljobs_description(card, title: str, company: str | None,
     return text[:max_chars].rstrip() + "…" if len(text) > max_chars else text
 
 
-# --------------------------------------------------------------------------- #
-# GotFriends
-# --------------------------------------------------------------------------- #
-#
-# Like AllJobs, GotFriends has no free-text URL parameter: /jobs/ takes only
-# ?page= and ?total=, and narrowing happens by walking into a category under
-# /jobslobby/. So a site is configured with the category pages wanted, and
-# its URL carries no {query}.
-#
-# A posting lives at /jobslobby/<area>/<role>/<number>/ and the agency hides
-# the hiring company by design, so `company` stays empty and Gemini judges
-# the role from the description.
-
 _GOTFRIENDS_JOB_HREF = re.compile(r"/jobslobby/[^?#]*?/(\d{4,})/?$", re.I)
 _GOTFRIENDS_LOCATION = re.compile(r"מיקום:\s*(.+)")
 _GOTFRIENDS_NOISE = re.compile(
@@ -738,7 +895,16 @@ _GOTFRIENDS_NOISE = re.compile(
 
 
 def gotfriends_listings(html: str, page_url: str) -> list[JobListing]:
-    """Parse one page of GotFriends results or one category page."""
+    """Parse one page of GotFriends results or one category page.
+
+    Args:
+        html: The page source.
+        page_url: The URL it came from, used to resolve relative links.
+
+    Returns:
+        One listing per posting, de-duplicated by job number. The company is
+        always None: the agency hides it by design.
+    """
     soup = BeautifulSoup(html, "html.parser")
     listings: list[JobListing] = []
     seen: set[str] = set()
@@ -749,7 +915,7 @@ def gotfriends_listings(html: str, page_url: str) -> list[JobListing]:
             continue
         title = " ".join(anchor.get_text(" ", strip=True).split())
         if not title:
-            continue        # an image or "read more" link to the same job
+            continue
         seen.add(number)
 
         card = _enclosing_card(anchor, _GOTFRIENDS_JOB_HREF)
@@ -767,6 +933,17 @@ def gotfriends_listings(html: str, page_url: str) -> list[JobListing]:
 
 
 def _gotfriends_description(card, title: str, max_chars: int = 900) -> str | None:
+    """Extract the advert body from a GotFriends card.
+
+    Args:
+        card: The element holding the card.
+        title: The job title, removed from the body.
+        max_chars: Where to trim the result.
+
+    Returns:
+        The body without the title or the card's repeated furniture, or None
+        when nothing is left.
+    """
     lines = []
     for line in card.get_text("\n", strip=True).split("\n"):
         line = " ".join(line.split())
@@ -780,15 +957,16 @@ def _gotfriends_description(card, title: str, max_chars: int = 900) -> str | Non
     return text[:max_chars].rstrip() + "…" if len(text) > max_chars else text
 
 
-# --------------------------------------------------------------------------- #
-# HTTP helpers
-# --------------------------------------------------------------------------- #
-
 _last_request_at: dict[str, float] = {}
 _robots_cache: dict[str, RobotFileParser | None] = {}
 
 
 def _build_session() -> requests.Session:
+    """Create an HTTP session with the crawler's default headers.
+
+    Returns:
+        A session identifying itself as USER_AGENT.
+    """
     session = requests.Session()
     session.headers.update({
         "User-Agent": USER_AGENT,
@@ -799,7 +977,23 @@ def _build_session() -> requests.Session:
 
 def _fetch(session: requests.Session, url: str,
            headers: dict[str, str] | None = None) -> tuple[str, str]:
-    """GET `url` and return (body, content-type)."""
+    """GET a URL, rate-limited per host.
+
+    Args:
+        session: The HTTP session to use.
+        url: The URL to fetch.
+        headers: Extra request headers for this site.
+
+    Returns:
+        The response body and its Content-Type header.
+
+    Raises:
+        ValueError: The site config carries credential headers, which this
+            crawler refuses to send.
+        LoginWallError: The site answered 401 or 403, or served a sign-in
+            page instead of results.
+        requests.HTTPError: The site returned another error status.
+    """
     host = urlparse(url).netloc
     elapsed = time.monotonic() - _last_request_at.get(host, 0.0)
     if elapsed < CRAWL_DELAY:
@@ -837,7 +1031,15 @@ _LOGIN_PATH = re.compile(
 
 
 def _is_login_page(response: requests.Response) -> bool:
-    """True if we landed on a sign-in wall rather than search results."""
+    """Report whether a response is a sign-in wall.
+
+    Args:
+        response: The fetched response.
+
+    Returns:
+        True when the final URL looks like a sign-in route or the body
+        carries a password field.
+    """
     if _LOGIN_PATH.search(urlparse(response.url).path):
         return True
     head = response.text[:20000].lower()
@@ -845,6 +1047,18 @@ def _is_login_page(response: requests.Response) -> bool:
 
 
 def _robots_allows(session: requests.Session, url: str) -> bool:
+    """Check robots.txt before fetching a URL.
+
+    The parsed file is cached per host. A site serving no usable robots.txt
+    is treated as allowing the fetch.
+
+    Args:
+        session: The HTTP session to use.
+        url: The URL about to be fetched.
+
+    Returns:
+        True when the crawler may fetch it.
+    """
     parsed = urlparse(url)
     root = f"{parsed.scheme}://{parsed.netloc}"
     if root not in _robots_cache:
@@ -852,7 +1066,7 @@ def _robots_allows(session: requests.Session, url: str) -> bool:
         try:
             resp = session.get(f"{root}/robots.txt", timeout=REQUEST_TIMEOUT)
             if resp.status_code >= 400:
-                parser = None  # no usable robots.txt -> treat as allowed
+                parser = None
             else:
                 parser.parse(resp.text.splitlines())
         except requests.RequestException:
@@ -863,6 +1077,17 @@ def _robots_allows(session: requests.Session, url: str) -> bool:
 
 
 def _coerce_site(site: SiteConfig | str) -> SiteConfig:
+    """Accept either a SiteConfig or a bare URL template.
+
+    Args:
+        site: A SiteConfig, or a URL template containing ``{query}``.
+
+    Returns:
+        A SiteConfig, named after the host when built from a template.
+
+    Raises:
+        ValueError: A string template does not contain ``{query}``.
+    """
     if isinstance(site, SiteConfig):
         return site
     if "{query}" not in site:
@@ -873,11 +1098,16 @@ def _coerce_site(site: SiteConfig | str) -> SiteConfig:
     return SiteConfig(name=urlparse(site).netloc or site, search_url=site)
 
 
-# --------------------------------------------------------------------------- #
-# Small utilities
-# --------------------------------------------------------------------------- #
-
 def _get(node: Any, *keys: str) -> Any:
+    """Follow a chain of keys into nested JSON.
+
+    Args:
+        node: The object to read.
+        *keys: Field names to follow in order.
+
+    Returns:
+        The value at the end of the chain, or None if any step is missing.
+    """
     for key in keys:
         if not isinstance(node, dict):
             return None
@@ -886,6 +1116,15 @@ def _get(node: Any, *keys: str) -> Any:
 
 
 def _text(value: Any) -> str | None:
+    """Clean a JSON value into display text.
+
+    Args:
+        value: The value to clean.
+
+    Returns:
+        The whitespace-collapsed string, or None when it is not a non-empty
+        string.
+    """
     if isinstance(value, str):
         cleaned = " ".join(value.split())
         return cleaned or None
@@ -893,6 +1132,15 @@ def _text(value: Any) -> str | None:
 
 
 def _strip_html(value: Any, max_chars: int = 600) -> str | None:
+    """Reduce an HTML advert body to trimmed plain text.
+
+    Args:
+        value: The body, which may carry markup.
+        max_chars: Where to trim the result.
+
+    Returns:
+        The plain text, ellipsised if trimmed, or None when it is empty.
+    """
     if not isinstance(value, str):
         return None
     text = " ".join(BeautifulSoup(value, "html.parser").get_text(" ").split())
